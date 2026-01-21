@@ -4,8 +4,8 @@ export const CARTRIDGES_URL =
   "https://raw.githubusercontent.com/lynoferraz/rives-barebones-doom/main/cartridges/freedoom.sqfs";
 
 // Network configuration
-// export const CHAIN_ID = "0x7A69"; // anvil devnet
-export const CHAIN_ID = "0x343A"; // Cannon devnet
+export const CHAIN_ID = "0x7A69"; // anvil devnet
+// export const CHAIN_ID = "0x343A"; // Cannon devnet
 
 // Application contract address
 export const APPLICATION_ADDRESS = "0x16b3e89fb69306ddbe4a0c1247b61d414e767ecd";

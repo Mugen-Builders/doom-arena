@@ -1,7 +1,7 @@
 [machine]
 ram-length = "256Mi"
 user = "root"
-entrypoint = "exec /mnt/app/rives-barebones"
+entrypoint = "/mnt/app/rives-barebones"
 use_docker_env = false # cartesi cli option to avoid using docker rootfs envs
 
 [drives.root]

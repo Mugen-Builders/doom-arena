@@ -13,7 +13,7 @@ HARDEN_CXXFLAGS = \
 	-fno-strict-aliasing \
 	-fno-strict-overflow
 
-	HARDEN2_CXXFLAGS = \
+HARDEN2_CXXFLAGS = \
 	-fno-rtti
 
 # Use C++20, without exceptions and RTTI to have minimal overhead and predictable behavior
@@ -55,9 +55,6 @@ SOURCES = $(addsuffix .cpp,$(ARTIFACTS))
 
 %: %.cpp $(OUT_DIR)
 	$(CXX) $(CXXFLAGS) $(HARDEN_CXXFLAGS) $(HARDEN2_CXXFLAGS) $(INCS) -o $(OUT_DIR)/$@ $< $(LDFLAGS) $(LIBS)
-
-deployer: deployer.cpp $(OUT_DIR)
-	$(CXX) $(CXXFLAGS) $(HARDEN_CXXFLAGS) $(INCS) -o $(OUT_DIR)/$@ $< $(LDFLAGS) $(LIBS) -lcrypto++
 
 $(OUT_DIR):
 	mkdir -p $@
