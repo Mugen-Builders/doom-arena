@@ -6,10 +6,7 @@ import {
   parseAbi,
 } from "viem";
 import { getWalletClient } from "../utils/chain.js";
-import { APPLICATION_ADDRESS } from "../consts.js";
-
-// Cartesi InputBox contract address (constant across deployments)
-const INPUT_BOX_ADDRESS = "0xc70074BDD26d8cF983Ca6A5b89b8db52D5850051" as const;
+import { APPLICATION_ADDRESS, INPUT_BOX_ADDRESS } from "../consts.js";
 
 const inputBoxAbi = parseAbi([
   "function addInput(address _app, bytes payload) payable",

@@ -20,11 +20,13 @@ jobs:
             CHAIN_ID
             APPLICATION_ADDRESS
             NODE_URL
+            INPUT_BOX_ADDRESS
           EMULATOR_URL: ${{ vars.EMULATOR_URL }}
           CARTRIDGES_URL: ${{ vars.CARTRIDGES_URL }}
           CHAIN_ID: ${{ vars.CHAIN_ID }}
           APPLICATION_ADDRESS: ${{ vars.APPLICATION_ADDRESS }}
           NODE_URL: ${{ vars.NODE_URL }}
+          INPUT_BOX_ADDRESS: ${{ vars.INPUT_BOX_ADDRESS }}
         run: |
           rm src/consts.ts
           for var in $ENV_VARIABLES; do

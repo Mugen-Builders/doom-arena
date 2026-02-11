@@ -107,7 +107,6 @@ a:hover {
 .header {
     display: flex;
     height: 30px;
-    width: 100%;
     text-align: center;
     padding: var(--spacing-md) var(--spacing-md);
     text-decoration: none;
