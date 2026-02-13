@@ -1,7 +1,7 @@
 # Rives Barebones with Doom
 
 ```
-Cartesi Rollups Node version: 2.0.x
+Cartesi Rollups Node version: 2.1.x
 ```
 
 The RiscV Entertainment System (RIVES) barebones with Doom is a proof of concept that allows users to play the [riscv-binary port of Freedoom](https://github.com/rives-io/cartridge-freedoom) on a RISC-v Cartesi Machine on the browser, submit the game moves onchain so the session will be replayed in a Cartesi Rollups App to generate a provable score.
@@ -22,7 +22,7 @@ Install Cartesapp:
 ```shell
 python3 -m venv .venv
 . .venv/bin/activate
-pip3 install cartesapp[dev]@git+https://github.com/prototyp3-dev/cartesapp@v1.1.1
+pip3 install cartesapp[dev]@git+https://github.com/prototyp3-dev/cartesapp@v1.2.1
 pip3 install pytest-randomly
 ```
 
@@ -76,8 +76,8 @@ Then define the `CARTESI_AUTH_PRIVATE_KEY`, `RPC_URL`, and `RPC_WS` (additionall
 RPC_URL=
 RPC_WS=
 CARTESI_BLOCKCHAIN_ID=11155111
-APPLICATION_ADDRESS=0x8703056F8A57eFB779875D5F9c172b4594fCd329
-CONSENSUS_ADDRESS=0x0870B1606F58F2F3feef7AD8A026E1543126F5BD
+APPLICATION_ADDRESS=0x338709834f3A4255E4bF3DabA8d1eFCA6cBcA385
+CONSENSUS_ADDRESS=0xE935fcf3236118C81d9D41592cB72f92a0336890
 ```
 
 Finally run the following command to start the node:
@@ -114,7 +114,7 @@ First, configure the constants in [website/src/consts.ts](website/src/consts.ts)
 export const CHAIN_ID = "0x7a69"; // Local devnet chain ID (31337 in hex)
 
 // Application contract address (from your node startup)
-export const APPLICATION_ADDRESS = "0xE34467a44bD506b0bCc4474eb19617b156D93c29";
+export const APPLICATION_ADDRESS = "0x6c060d453705bc56797d84516feb949c9bd53caa";
 
 // Cartesi node URL
 export const NODE_URL = "http://localhost:8080";
@@ -166,8 +166,8 @@ This will generate a file called `gameplay.rivlog` with the gameplay logs and a 
 Then you can submit the gameplay with the command next. We'll assume you are using the local devnet initiated on one of the previous steps (set the application address and blockchain configuration with the correct values):
 
 ```shell
-INPUTBOX_ADDRESS=0xc70074BDD26d8cF983Ca6A5b89b8db52D5850051
-APPLICATION_ADDRESS=0xE34467a44bD506b0bCc4474eb19617b156D93c29
+INPUTBOX_ADDRESS=0x1b51e2992A2755Ba4D6F7094032DF91991a0Cfac
+APPLICATION_ADDRESS=0x6c060d453705bc56797d84516feb949c9bd53caa
 PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 cast send --private-key ${PRIVATE_KEY} ${INPUTBOX_ADDRESS} "addInput(address,bytes)" ${APPLICATION_ADDRESS} 0x$(cat gameplay.outhash)$(xxd -p -c10000 gameplay.rivlog)
 ```
