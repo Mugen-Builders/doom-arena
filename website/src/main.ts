@@ -1,5 +1,6 @@
 // External imports
 import {
+  type Hex,
   toHex,
   isHex,
   decodeAbiParameters,
@@ -17,7 +18,12 @@ import {
   EMULATOR_URL,
   NODE_URL,
 } from "./consts.js";
-import { connectWalletClient, submitGameplay } from "./lib/onchain.js";
+import {
+  connectWalletClient,
+  submitGameplay,
+  validateGameplay,
+  type Proof,
+} from "./lib/onchain.js";
 import { getL2Client } from "./utils/chain.js";
 
 interface EmulatorParams {
@@ -35,6 +41,8 @@ interface VerificationNotice {
   timestamp: bigint;
   score: bigint;
   input_index: bigint;
+  payload?: `0x${string}`;
+  proof?: Proof | null;
 }
 
 type RpcFilter = {
@@ -109,6 +117,13 @@ function decodeVerificationNotice(output: Output): VerificationNotice | null {
       timestamp: decoded[1] as bigint,
       score: decoded[2] as bigint,
       input_index: decoded[3] as bigint,
+      payload: output.rawData,
+      proof: output.outputHashesSiblings
+        ? {
+            outputIndex: output.index,
+            outputHashesSiblings: output.outputHashesSiblings,
+          }
+        : null,
     };
   } catch (error) {
     // Not a verification notice or invalid format
@@ -334,7 +349,36 @@ function populateLeaderboardTable(
       new Date(Number(notice.timestamp) * 1000),
     );
     row.insertCell().innerHTML = `${notice.score}`;
+    const msgCellId = `leaderboard-score-${notice.input_index}`;
     // row.insertCell().innerHTML = `${notice.input_index}`;
+    const actionCell = row.insertCell();
+    actionCell.innerHTML = "check";
+    actionCell.className = "leaderboardButton";
+    actionCell.onclick = (event) => {
+      event.stopPropagation();
+      validateScore(msgCellId, notice.payload, notice.proof);
+    };
+    row.insertCell().id = msgCellId;
+  }
+}
+
+export async function validateScore(
+  cellId: string,
+  payload?: `0x${string}`,
+  proof?: Proof,
+) {
+  const el = document.getElementById(cellId);
+  if (el) {
+    el.innerHTML = "Validating...";
+    try {
+      if (await validateGameplay(payload, proof)) {
+        el.innerHTML = "✅"; //"&#9989;"; // "&#9745;";
+      } else {
+        el.innerHTML = "✖"; //"&amp;#10060;";
+      }
+    } catch (e) {
+      el.innerHTML = `❌ ${e}`; // "&amp;#10005;"
+    }
   }
 }
 
@@ -387,7 +431,7 @@ export async function renderLeaderboard(): Promise<void> {
       }
       const row = table.insertRow();
       const cell = row.insertCell();
-      cell.colSpan = 5;
+      cell.colSpan = 7;
       cell.innerHTML = "No leaderboard data available";
       return;
     }
@@ -401,7 +445,7 @@ export async function renderLeaderboard(): Promise<void> {
     }
     const row = table.insertRow();
     const cell = row.insertCell();
-    cell.colSpan = 5;
+    cell.colSpan = 7;
     cell.innerHTML = "Error loading leaderboard data";
   }
 }

@@ -5,8 +5,13 @@ import {
   WalletClient,
   parseAbi,
 } from "viem";
-import { getWalletClient } from "../utils/chain.js";
+import { getWalletClient, getChain } from "../utils/chain.js";
 import { APPLICATION_ADDRESS, INPUT_BOX_ADDRESS } from "../consts.js";
+
+export interface Proof {
+  outputIndex: bigint;
+  outputHashesSiblings: `0x${string}`[];
+}
 
 const inputBoxAbi = parseAbi([
   "function addInput(address _app, bytes payload) payable",
@@ -64,4 +69,51 @@ export async function submitGameplay(
 
   const txHash = await walletClient.writeContract(request);
   await publicClient.waitForTransactionReceipt({ hash: txHash });
+}
+
+export async function validateGameplay(
+  payload?: `0x${string}`,
+  proof?: Proof | null,
+): Promise<boolean> {
+  if (!payload || !payload.startsWith("0x") || payload.length <= 2) {
+    throw new Error("No payload");
+  }
+  if (!proof) {
+    throw new Error("No proof");
+  }
+
+  if (!window.ethereum) {
+    throw new Error("Ethereum provider not available");
+  }
+
+  const chainIdHex = (await window.ethereum.request({
+    method: "eth_chainId",
+  })) as `0x${string}`;
+  const currentChainId = fromHex(chainIdHex, "number");
+  const chain = getChain(currentChainId);
+  if (!chain) {
+    throw new Error("Couldn't get chain");
+  }
+
+  try {
+    const publicClient = createPublicClient({
+      chain: chain,
+      transport: http(),
+    });
+    const args = [payload, [proof.outputIndex, proof.outputHashesSiblings]];
+    await publicClient.readContract({
+      address: APPLICATION_ADDRESS,
+      abi: parseAbi([
+        "function validateOutput(bytes,(uint64,bytes32[])) view",
+        "error InvalidOutputHashesSiblingsArrayLength()",
+        "error InvalidOutputsMerkleRoot(bytes32 outputsMerkleRoot)",
+      ]),
+      functionName: "validateOutput",
+      args: args,
+    });
+  } catch (e) {
+    console.warn("Failed to validate notice", e);
+    return false;
+  }
+  return true;
 }

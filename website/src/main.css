@@ -299,3 +299,31 @@ main {
     color: var(--color-white);
     text-align: center;
 }
+
+/* Leaderboard Page */
+.leaderboardButton {
+    background-color: #a3a3a3; /* Green background */
+    border-top: 1px solid #cccccc;
+    border-right: 1px solid #333333;
+    border-bottom: 1px solid #333333;
+    border-left: 1px solid #cccccc;
+    padding: 15px 32px;
+    text-align: center;
+    text-decoration: none;
+    display: inline-block;
+    cursor: pointer;
+    border-radius: 4px;
+    transition:
+        background-color 0.3s,
+        transform 0.1s; /* Smooth transitions */
+}
+
+.leaderboardButton:hover {
+    background-color: #8c8c8c; /* Darker green on hover */
+}
+
+.leaderboardButton:active {
+    /* Effect when the button is pressed */
+    transform: translateY(2px); /* Pushes the button down slightly */
+    box-shadow: inset 0 0 5px #333; /* Adds an inset shadow to look "pressed" */
+}
