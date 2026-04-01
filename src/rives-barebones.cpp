@@ -1,16 +1,17 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <cctype>  // Necessário para tolower
 #include <cerrno>  // errno
 #include <cstdio>  // std::fprintf/stderr
 #include <cstdlib> // std::strerror
 #include <cstring> // std::strerror
+#include <format>
 #include <fstream> // file stream operations
 #include <iomanip> // Required for std::hex, std::setw, std::setfill
 #include <regex>
 #include <sstream> // Required for std::stringstream
-#include <stdexcept>
-#include <string> // for string class
+#include <string>  // for string class
 
 #include <array> // std::array
 #include <tuple> // std::ignore
@@ -37,7 +38,68 @@ extern "C" {
 #define MAX_ERROR_MESSAGE_LENGTH 256
 #define MAX_ERROR_REPORT_LENGTH MAX_ERROR_MESSAGE_LENGTH + 50
 
+#define DEBUG(X) log_debug(X)
+#define ERROR(X) log_error(X, __FILE__, __LINE__)
+
 namespace {
+
+bool debug_enabled(void) {
+  static bool checked = false;
+  static bool enabled = false;
+
+  if (!checked) {
+    if (getenv("RIVES_LOG_LEVEL") != NULL) {
+      std::string log_level = getenv("RIVES_LOG_LEVEL");
+      std::transform(log_level.begin(), log_level.end(), log_level.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      std::string trace_log_level = "trace";
+      std::string debug_log_level = "debug";
+      if (log_level == trace_log_level || log_level == debug_log_level) {
+        enabled = true;
+      }
+    }
+    checked = true;
+  }
+
+  return enabled;
+}
+
+bool error_enabled(void) {
+  static bool checked = false;
+  static bool enabled = false;
+
+  if (!checked) {
+    if (getenv("RIVES_LOG_LEVEL") != NULL) {
+      std::string log_level = getenv("RIVES_LOG_LEVEL");
+      std::transform(log_level.begin(), log_level.end(), log_level.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      std::string trace_log_level = "trace";
+      std::string debug_log_level = "debug";
+      std::string warn_log_level = "warn";
+      std::string error_log_level = "error";
+      if (log_level == trace_log_level || log_level == debug_log_level ||
+          log_level == warn_log_level || log_level == error_log_level) {
+        enabled = true;
+      }
+    }
+    checked = true;
+  }
+
+  return enabled;
+}
+
+static void log_debug(std::string expr) {
+  if (debug_enabled()) {
+    std::ignore = std::fprintf(stdout, "[rives] DEBUG %s\n", expr.c_str());
+  }
+}
+
+static void log_error(std::string expr, const char *file, int line) {
+  if (error_enabled()) {
+    std::ignore = std::fprintf(stderr, "[rives] ERROR %s:%d %s\n", file, line,
+                               expr.c_str());
+  }
+}
 
 using be256 = std::array<uint8_t, BE256_SIZE>;
 
@@ -74,8 +136,7 @@ struct [[gnu::packed]] gameplay_notice {
 template <typename T>
 [[nodiscard]]
 constexpr cmt_abi_bytes_t payload_to_bytes(const T &payload) {
-  std::ignore = std::fprintf(stdout, "[rives] payload_to_bytes size %zu\n",
-                             sizeof(payload));
+  DEBUG(std::format("payload_to_bytes size {}", sizeof(payload)));
   cmt_abi_bytes_t payload_bytes = {
       .length = sizeof(payload),
       .data = const_cast<T *>(
@@ -90,8 +151,7 @@ bool rollup_emit_report(cmt_rollup_t *rollup,
                         const cmt_abi_bytes_t &payload_bytes) {
   const int err = cmt_rollup_emit_report(rollup, &payload_bytes);
   if (err < 0) {
-    std::ignore = std::fprintf(stderr, "[rives] unable to emit report: %s\n",
-                               std::strerror(-err));
+    ERROR(std::format("unable to emit report: {}", std::strerror(-err)));
     return false;
   }
   return true;
@@ -101,13 +161,10 @@ bool rollup_emit_report(cmt_rollup_t *rollup,
 [[nodiscard]]
 bool rollup_emit_notice(cmt_rollup_t *rollup,
                         const cmt_abi_bytes_t &payload_bytes) {
-  std::ignore =
-      std::fprintf(stdout, "[rives] notice payload bytes length %zu\n",
-                   payload_bytes.length);
+  DEBUG(std::format("notice payload bytes length {}", payload_bytes.length));
   const int err = cmt_rollup_emit_notice(rollup, &payload_bytes, nullptr);
   if (err < 0) {
-    std::ignore = std::fprintf(stderr, "[rives] unable to emit notice: %s\n",
-                               std::strerror(-err));
+    ERROR(std::format("unable to emit notice: {}", std::strerror(-err)));
     return false;
   }
   return true;
@@ -124,16 +181,14 @@ bool rollup_process_next_request(cmt_rollup_t *rollup,
                                  bool last_request_status) {
 
   // Finish previous request and wait for the next request.
-  std::ignore = std::fprintf(
-      stdout, "[rives] finishing previous request with status %d\n",
-      last_request_status);
+  DEBUG(std::format("finishing previous request with status {}",
+                    last_request_status));
   cmt_rollup_finish_t finish{.accept_previous_request = last_request_status};
   sync(); // ensure data is written to disk
   const int err = cmt_rollup_finish(rollup, &finish);
   if (err < 0) {
-    std::ignore =
-        std::fprintf(stderr, "[rives] unable to perform rollup finish: %s\n",
-                     std::strerror(-err));
+    ERROR(std::format("unable to perform rollup finish: {}",
+                      std::strerror(-err)));
     return false;
   }
 
@@ -147,7 +202,7 @@ bool rollup_process_next_request(cmt_rollup_t *rollup,
     return inspect_state(rollup);
   }
   default: { // Invalid request.
-    std::ignore = std::fprintf(stderr, "[rives] invalid request type\n");
+    ERROR("invalid request type");
     return false;
   }
   }
@@ -233,8 +288,7 @@ void process_verification(cmt_rollup_t *rollup,
   for (int i(0); i < CMT_ABI_ADDRESS_LENGTH; ++i)
     msg_sender_ss << std::setw(2) << std::setfill('0')
                   << static_cast<int>(input.msg_sender.data[i]);
-  std::ignore = std::fprintf(stdout, "[rives] Msg sender: %s\n",
-                             msg_sender_ss.str().c_str());
+  DEBUG(std::format("Msg sender: {}", msg_sender_ss.str().c_str()));
 
   // Step 2.2: prepare temp files
   //
@@ -289,17 +343,24 @@ void process_verification(cmt_rollup_t *rollup,
   } else if (pid == 0) {
     // child
 
-    std::ignore = std::fprintf(
-        stdout,
-        "[rives] full cmd: /rivos/usr/sbin/riv-chroot /rivos --setenv "
-        "RIV_CARTRIDGE %s --setenv RIV_REPLAYLOG %s --setenv RIV_OUTCARD %s "
-        "--setenv RIV_OUTHASH %s --setenv RIV_NO_YIELD y --setenv "
+    DEBUG(std::format(
+        "full cmd: /rivos/usr/sbin/riv-chroot /rivos --setenv "
+        "RIV_CARTRIDGE {} --setenv RIV_REPLAYLOG {} --setenv RIV_OUTCARD {} "
+        "--setenv RIV_OUTHASH {} --setenv RIV_NO_YIELD y --setenv "
         "RIV_ENTROPY "
-        "%s "
-        "riv-run\n",
+        "{} "
+        "riv-run",
         CARTRIDGE_PATH, gameplay_log_file.path, outcard_file.path,
-        outhash_file.path, msg_sender_ss.str().c_str());
+        outhash_file.path, msg_sender_ss.str().c_str()));
 
+    if (!debug_enabled()) {
+      int fd = open("/dev/null", O_WRONLY);
+      if (fd == -1) {
+        throw RivesException("failed to open /dev/null to suppress stdout",
+                             STATUS_FILE_ERROR);
+      }
+      dup2(fd, STDOUT_FILENO); // Redirect stdout to /dev/null
+    }
     const int err =
         execl("/rivos/usr/sbin/riv-chroot", "/rivos/usr/sbin/riv-chroot",
               "/rivos", "--setenv", "RIV_CARTRIDGE", CARTRIDGE_PATH, "--setenv",
@@ -309,9 +370,7 @@ void process_verification(cmt_rollup_t *rollup,
               "RIV_ENTROPY", msg_sender_ss.str().c_str(), "riv-run", NULL);
 
     if (err != 0) {
-      std::ignore =
-          std::fprintf(stderr, "[rives] error running verification: %s\n",
-                       std::strerror(-err));
+      ERROR(std::format("error running verification: {}", std::strerror(-err)));
       _exit(STATUS_VERIFICATION_ERROR);
     }
 
@@ -320,8 +379,8 @@ void process_verification(cmt_rollup_t *rollup,
 
   int status;
   waitpid(pid, &status, 0);
-  std::ignore = std::fprintf(stdout, "[rives] wait status: %d (%d, %d)\n",
-                             status, WIFEXITED(status), WEXITSTATUS(status));
+  DEBUG(std::format("wait status: {} ({}, {})", status, WIFEXITED(status),
+                    WEXITSTATUS(status)));
 
   if (!WIFEXITED(status) || WEXITSTATUS(status) != STATUS_SUCCESS) {
     throw RivesException("error running verification",
@@ -367,8 +426,7 @@ void process_verification(cmt_rollup_t *rollup,
 
   outcard_filefs.close();
 
-  std::ignore =
-      std::fprintf(stdout, "[rives] outcard: %s\n", outcard_str.c_str());
+  DEBUG(std::format("outcard: {}", outcard_str.c_str()));
 
   // Step 5: cleanup temp files
   // done in unique_temp_file class destructor
@@ -377,8 +435,7 @@ void process_verification(cmt_rollup_t *rollup,
   static const std::regex score_pattern(R"("score":\s*(\d+)\s*,)");
   std::smatch score_matches;
 
-  std::ignore = std::fprintf(
-      stdout, "[rives] looking for score matches from outcard file\n");
+  DEBUG("looking for score matches from outcard file");
 
   if (!std::regex_search(outcard_str, score_matches, score_pattern) ||
       !score_matches.ready() || score_matches.size() < 2) {
@@ -386,12 +443,9 @@ void process_verification(cmt_rollup_t *rollup,
                          STATUS_OUTCARD_ERROR);
   }
 
-  std::ignore = std::fprintf(stdout, "[rives] found score matches=%ld\n",
-                             score_matches.size());
-  std::ignore = std::fprintf(stdout, "[rives] full match: %s\n",
-                             score_matches[0].str().c_str());
-  std::ignore = std::fprintf(stdout, "[rives] group 1: %s\n",
-                             score_matches[1].str().c_str());
+  DEBUG(std::format("found score matches={}", score_matches.size()));
+  DEBUG(std::format("full match: {}", score_matches[0].str().c_str()));
+  DEBUG(std::format("group 1: {}", score_matches[1].str().c_str()));
 
   int64_t score = std::stoi(score_matches[1].str());
 
@@ -412,9 +466,8 @@ void process_verification(cmt_rollup_t *rollup,
 
   // Step 7: emit notice (can't revert after, so no errors from here on)
 
-  std::ignore = std::fprintf(stdout, "[rives] Sending notice\n");
-  std::ignore =
-      std::fprintf(stdout, "[rives] notice size %zu\n", sizeof(notice));
+  DEBUG("Sending notice");
+  DEBUG(std::format("notice size {}", sizeof(notice)));
 
   const cmt_abi_bytes_t notice_bytes = {.length = sizeof(notice),
                                         .data = &notice};
@@ -427,28 +480,24 @@ void process_verification(cmt_rollup_t *rollup,
 bool advance_state(cmt_rollup_t *rollup) {
   try {
     // Read the input.
-    std::ignore = std::fprintf(stderr, "[rives] advance request\n");
+    DEBUG("advance request");
     cmt_rollup_advance_t input{};
     const int err = cmt_rollup_read_advance_state(rollup, &input);
     if (err < 0) {
-      std::ignore =
-          std::fprintf(stderr, "[rives] unable to read advance state: %s\n",
-                       std::strerror(-err));
-      std::ignore = std::fprintf(stderr, "[rives] forcing exit\n");
+      ERROR(
+          std::format("unable to read advance state: {}", std::strerror(-err)));
+      ERROR("forcing exit");
       exit(-EINVAL); // force exit. Exceptional error
     }
 
-    std::ignore =
-        std::fprintf(stdout, "[rives] advance request with size %zu\n",
-                     input.payload.length);
+    DEBUG(std::format("advance request with size {}", input.payload.length));
 
     process_verification(rollup, input);
-    std::ignore = std::fprintf(stderr, "[rives] gameplay verified\n");
+    ERROR("gameplay verified");
 
   } catch (const RivesException &e) {
-    std::ignore =
-        std::fprintf(stderr, "[rives] rives exception caught: (%d) %s\n",
-                     e.code(), e.what());
+    ERROR(std::format("rives exception caught: ({}) {}",
+                      static_cast<uint8_t>(e.code()), e.what()));
     size_t report_length;
     char *report_payload =
         rives_report_payload(e.code(), e.what(), &report_length);
@@ -458,10 +507,9 @@ bool advance_state(cmt_rollup_t *rollup) {
                                             .data = report_payload};
       std::ignore = rollup_emit_report(rollup, report_bytes);
     }
-    // return false; // No reverts
+    return false;
   } catch (const std::exception &e) {
-    std::ignore =
-        std::fprintf(stderr, "[rives] exception caught: %s\n", e.what());
+    ERROR(std::format("exception caught: {}", e.what()));
     size_t report_length;
     char *report_payload = rives_report_payload(STATUS_RUNTIME_EXCEPTION,
                                                 e.what(), &report_length);
@@ -471,9 +519,9 @@ bool advance_state(cmt_rollup_t *rollup) {
                                             .data = report_payload};
       std::ignore = rollup_emit_report(rollup, report_bytes);
     }
-    // return false; // No reverts
+    return false;
   } catch (...) {
-    std::ignore = std::fprintf(stderr, "[rives] unknown exception caught\n");
+    ERROR("unknown exception caught");
     size_t report_length;
     char *report_payload = rives_report_payload(
         STATUS_UNKNOWN_EXCEPTION, "unknown exception caught", &report_length);
@@ -483,7 +531,7 @@ bool advance_state(cmt_rollup_t *rollup) {
                                             .data = report_payload};
       std::ignore = rollup_emit_report(rollup, report_bytes);
     }
-    // return false; // No reverts
+    return false;
   }
   return true;
 }
@@ -494,16 +542,13 @@ bool inspect_state(cmt_rollup_t *rollup) {
   cmt_rollup_inspect_t input{};
   const int err = cmt_rollup_read_inspect_state(rollup, &input);
   if (err < 0) {
-    std::ignore =
-        std::fprintf(stderr, "[rives] unable to read inspect state: %s\n",
-                     std::strerror(-err));
+    ERROR(std::format("unable to read inspect state: {}", std::strerror(-err)));
     return false;
   }
-  std::ignore = std::fprintf(stdout, "[rives] inspect request with size %zu\n ",
-                             input.payload.length);
+  DEBUG(std::format("inspect request with size {}", input.payload.length));
 
-  std::ignore = std::fprintf(stderr, "[rives] inspect ignored\n");
-  return false;
+  DEBUG("inspect ignored");
+  return true;
 }
 }; // anonymous namespace
 
@@ -512,18 +557,16 @@ int main() {
   cmt_rollup_t rollup{};
   // Disable buffering of stderr to avoid dynamic allocations behind the scenes
   if (std::setvbuf(stderr, nullptr, _IONBF, 0) != 0) {
-    std::ignore =
-        std::fprintf(stderr, "[rives] unable to disable stderr buffering: %s\n",
-                     std::strerror(errno));
+    ERROR(std::format("unable to disable stderr buffering: {}",
+                      std::strerror(errno)));
     return -1;
   }
 
   // Initialize rollup device.
   const int err = cmt_rollup_init(&rollup);
   if (err != 0) {
-    std::ignore =
-        std::fprintf(stderr, "[rives] unable to initialize rollup device: %s\n",
-                     std::strerror(-err));
+    ERROR(std::format("unable to initialize rollup device: {}",
+                      std::strerror(-err)));
     return -1;
   }
 
@@ -531,24 +574,22 @@ int main() {
   if (stat(MERKLE_PATH, &buffer) == 0) {
     const int err_merkle = cmt_rollup_load_merkle(&rollup, MERKLE_PATH);
     if (err_merkle != 0) {
-      std::ignore =
-          std::fprintf(stderr, "[rives] unable to load merkle tree: %s\n",
-                       std::strerror(-err_merkle));
+      ERROR(std::format("unable to load merkle tree: {}",
+                        std::strerror(-err_merkle)));
       return -1;
     }
   }
 
   // Process requests forever.
-  std::ignore = std::fprintf(stderr, "[rives] processing rollup requests...\n");
+  DEBUG("processing rollup requests...\n");
   bool last_request_status = true;
   while (true) {
     if (last_request_status) {
       mode_t original_umask = umask(0000);
       const int err_merkle = cmt_rollup_save_merkle(&rollup, MERKLE_PATH);
       if (err_merkle != 0) {
-        std::ignore =
-            std::fprintf(stderr, "[rives] unable to save merkle tree: %s\n",
-                         std::strerror(-err_merkle));
+        ERROR(std::format("unable to save merkle tree: {}",
+                          std::strerror(-err_merkle)));
         return -1;
       }
       umask(original_umask);
