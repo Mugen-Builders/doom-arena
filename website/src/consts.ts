@@ -9,7 +9,7 @@ export const CHAIN_ID = "0x7A69"; // anvil devnet
 // export const CHAIN_ID = "0x14a34"; // base sepolia
 
 // Application contract address
-export const APPLICATION_ADDRESS = "0x2D5c26F85449b7770b1A8eA01981AD3712c1BDc1";
+export const APPLICATION_ADDRESS = "0xAD99e7c1c9bb884c7fa97d15E7fEDCeA04586abe";
 // export const APPLICATION_ADDRESS = "0x90557BEd8755d2bB1b943e6f151267d7a219B90C"; // salt 1
 // export const APPLICATION_ADDRESS = ""; // Cartesapp blank Deployment
 // export const APPLICATION_ADDRESS = "0x338709834f3A4255E4bF3DabA8d1eFCA6cBcA385"; // sepolia

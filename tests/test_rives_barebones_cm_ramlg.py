@@ -40,7 +40,7 @@ def test_should_fail_ram_long_gameplay(
     last_report_n = len(app_client.rollup.reports)
     app_client.send_advance(hex_payload=hex_payload)
 
-    assert app_client.rollup.status # No reverts
+    assert not app_client.rollup.status
     assert len(app_client.rollup.notices) == last_notice_n
     assert len(app_client.rollup.reports) == last_report_n + 1
 

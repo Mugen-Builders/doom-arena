@@ -51,7 +51,7 @@ def test_should_fail_short_payload(
     last_report_n = len(app_client.rollup.reports)
     app_client.send_advance(hex_payload="0x")
 
-    assert app_client.rollup.status # No reverts
+    assert not app_client.rollup.status
     assert len(app_client.rollup.notices) == last_notice_n
     assert len(app_client.rollup.reports) == last_report_n + 1
 
@@ -79,7 +79,7 @@ def test_should_fail_submit_short_gameplay(
     last_report_n = len(app_client.rollup.reports)
     app_client.send_advance(hex_payload=hex_payload)
 
-    assert app_client.rollup.status # No reverts
+    assert not app_client.rollup.status
     assert len(app_client.rollup.notices) == last_notice_n
     assert len(app_client.rollup.reports) == last_report_n + 1
 
@@ -99,7 +99,7 @@ def test_should_fail_submit_long_payload(
     last_report_n = len(app_client.rollup.reports)
     app_client.send_advance(hex_payload=hex_payload)
 
-    assert not app_client.rollup.status # No reverts
+    assert not app_client.rollup.status
     assert len(app_client.rollup.notices) == last_notice_n
     assert len(app_client.rollup.reports) == last_report_n
 
@@ -114,7 +114,7 @@ def test_should_fail_submit_long_gameplay(
     last_report_n = len(app_client.rollup.reports)
     app_client.send_advance(hex_payload=hex_payload)
 
-    assert app_client.rollup.status # No reverts
+    assert not app_client.rollup.status
     assert len(app_client.rollup.notices) == last_notice_n
     assert len(app_client.rollup.reports) == last_report_n + 1
 
@@ -134,7 +134,7 @@ def test_should_fail_submit_long_gameplay2(
     last_report_n = len(app_client.rollup.reports)
     app_client.send_advance(hex_payload=hex_payload)
 
-    assert app_client.rollup.status # No reverts
+    assert not app_client.rollup.status
     assert len(app_client.rollup.notices) == last_notice_n
     assert len(app_client.rollup.reports) == last_report_n + 1
 
@@ -154,7 +154,7 @@ def test_should_submit_invalid_gameplay(
     last_report_n = len(app_client.rollup.reports)
     app_client.send_advance(hex_payload=hex_payload)
 
-    assert app_client.rollup.status # No reverts
+    assert not app_client.rollup.status
     assert len(app_client.rollup.notices) == last_notice_n
     assert len(app_client.rollup.reports) == last_report_n + 1
 
@@ -174,7 +174,7 @@ def test_should_submit_invalid_outhash(
     last_report_n = len(app_client.rollup.reports)
     app_client.send_advance(hex_payload=hex_payload)
 
-    assert app_client.rollup.status # No reverts
+    assert not app_client.rollup.status
     assert len(app_client.rollup.notices) == last_notice_n
     assert len(app_client.rollup.reports) == last_report_n + 1
 
@@ -193,7 +193,7 @@ def test_should_submit_nop_gameplay(
     last_report_n = len(app_client.rollup.reports)
     app_client.send_advance(hex_payload=hex_payload)
 
-    assert app_client.rollup.status # No reverts
+    assert app_client.rollup.status
     assert len(app_client.rollup.notices) == last_notice_n + 1
     assert len(app_client.rollup.reports) == last_report_n
 
@@ -214,7 +214,7 @@ def test_should_submit_nop_gameplay_another_user(
     last_report_n = len(app_client.rollup.reports)
     app_client.send_advance(hex_payload=hex_payload, msg_sender=USER2)
 
-    assert app_client.rollup.status # No reverts
+    assert app_client.rollup.status
     assert len(app_client.rollup.notices) == last_notice_n + 1
     assert len(app_client.rollup.reports) == last_report_n
 
@@ -235,7 +235,7 @@ def test_should_submit_noplg_gameplay(
     last_report_n = len(app_client.rollup.reports)
     app_client.send_advance(hex_payload=hex_payload)
 
-    assert app_client.rollup.status # No reverts
+    assert app_client.rollup.status
     assert len(app_client.rollup.notices) == last_notice_n + 1
     assert len(app_client.rollup.reports) == last_report_n
 
@@ -256,7 +256,7 @@ def test_should_submit_gameplay(
     last_report_n = len(app_client.rollup.reports)
     app_client.send_advance(hex_payload=hex_payload)
 
-    assert app_client.rollup.status # No reverts
+    assert app_client.rollup.status
     assert len(app_client.rollup.notices) == last_notice_n + 1
     assert len(app_client.rollup.reports) == last_report_n
 
@@ -278,7 +278,7 @@ def test_should_submit_gameplay_another_user(
     last_report_n = len(app_client.rollup.reports)
     app_client.send_advance(hex_payload=hex_payload, msg_sender=USER2)
 
-    assert app_client.rollup.status # No reverts
+    assert app_client.rollup.status
     assert len(app_client.rollup.notices) == last_notice_n + 1
     assert len(app_client.rollup.reports) == last_report_n
 
@@ -292,8 +292,8 @@ def test_should_submit_gameplay_another_user(
 # test inspect
 def test_should_receive_inspect_no_data(app_client: TestClient):
     app_client.send_inspect(hex_payload='0x')
-    assert not app_client.rollup.status
+    assert app_client.rollup.status
 
 def test_should_receive_inspect_any_data(app_client: TestClient):
     app_client.send_inspect(hex_payload='0x00')
-    assert not app_client.rollup.status
+    assert app_client.rollup.status
