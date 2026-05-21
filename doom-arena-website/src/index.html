@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Doom Arena // Cartesi</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Space+Grotesk:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="arena.css" />
+</head>
+<body>
+
+  <!-- =====================================================
+       TOP BAR
+       ===================================================== -->
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <span>Doom Arena<small>// powered by Cartesi</small></span>
+      </div>
+      <nav class="nav">
+        <a href="#how" id="how-link">How it works</a>
+      </nav>
+      <div class="wallet">
+        <span class="chain-pill"><span class="dot pulse" id="net-dot"></span><span id="net-label">BASE-SEPOLIA</span></span>
+        <button class="btn" id="connect-btn">Connect Wallet</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="shell">
+
+    <!-- =====================================================
+         HERO — title row
+         ===================================================== -->
+    <section class="hero-head">
+      <div class="title-block">
+        <div class="eyebrow">
+          Freedoom //
+          <span class="mono" id="cartridge-id">0xA18d…80C0</span>
+          <span style="color:var(--accent);margin-left:8px">●</span>
+          <span style="margin-left:4px" id="hero-chain">LIVE ON BASE-SEPOLIA</span>
+        </div>
+        <h1>A <span class="accent">Verifiable Arena</span> for the FPS Classic.</h1>
+        <p class="hero-sub">Every item, kill, secret, and level boosts your score — every second drops it. Submit your run and the Cartesi Rollup replays it deterministically to prove your score.</p>
+      </div>
+      <div class="title-actions">
+        <button class="btn ghost" id="reload-btn" title="Refresh leaderboard + rollup state">↻ Reload</button>
+      </div>
+    </section>
+
+    <!-- =====================================================
+         STAGE — canvas + side panel
+         ===================================================== -->
+    <section class="stage">
+
+      <!-- LEFT: canvas -->
+      <div class="canvas-wrap">
+        <div class="canvas-frame" id="game-frame" tabindex="0">
+          <span class="canvas-corner-tr"></span>
+          <span class="canvas-corner-bl"></span>
+
+          <!-- Replay-mode badge (visible only when .is-replay) -->
+          <div class="replay-badge" id="replay-badge">
+            <span class="dot pulse"></span>
+            <span>REPLAY</span>
+            <span class="sep">·</span>
+            <span class="mono" id="replay-meta">run #—</span>
+            <button class="exit-replay" id="exit-replay" title="Exit replay">×</button>
+          </div>
+
+          <!-- Emulator iframe -->
+          <iframe
+            id="emulator-iframe"
+            title="Doom Emulator"
+            allowfullscreen
+            allow="autoplay; gamepad; fullscreen"
+          ></iframe>
+
+          <!-- Loading placeholder shown until iframe src is set -->
+          <div class="canvas-slot" id="canvas-slot">
+            <div class="tag">
+              <b>// LOADING CARTRIDGE</b>
+              <span>connecting to emulator…</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Canvas footer: replay scrubber / status -->
+        <div class="canvas-foot" id="canvas-foot">
+          <div class="canvas-foot-left">
+            <span class="label" id="foot-status">READY</span>
+          </div>
+          <div class="canvas-foot-right" id="replay-controls" hidden>
+            <button class="ico-btn" id="rp-prev" title="Previous run">◀◀</button>
+            <button class="ico-btn" id="rp-next" title="Next run">▶▶</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT: side panel -->
+      <aside class="side">
+
+        <!-- Leaderboard -->
+        <div class="panel">
+          <div class="panel-head">
+            <span class="label">Leaderboard</span>
+            <span class="label dim" id="board-count">— runs</span>
+          </div>
+          <div class="board" id="scoreboard">
+            <!-- rows injected -->
+          </div>
+        </div>
+
+        <!-- Rollup state — compact -->
+        <div class="panel" id="lifecycle">
+          <div class="panel-head">
+            <span class="label">Rollup state</span>
+            <span class="label dim" id="lc-fetched-pill">—</span>
+          </div>
+
+          <div class="lc-compact-mini">
+            <div class="lc-bignum">
+              <span class="v" id="lc-last">—</span>
+              <span class="l">last accepted epoch</span>
+            </div>
+
+            <div class="lc-current" id="lc-current">
+              <div class="lc-current-head">
+                <span class="status-with-dot">
+                  <span class="dot pulse" id="lc-current-dot"></span>
+                  <span class="status status-open" id="lc-current-status">OPEN</span>
+                </span>
+                <span class="mono dim" id="lc-current-idx">epoch #—</span>
+              </div>
+              <div class="lc-current-row">
+                <span class="mono" id="lc-current-inputs">— inputs</span>
+                <span class="mono dim" id="lc-current-age">—</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel-foot">
+            <span class="mono dim" id="lc-app-pill">0xA18d…80C0</span>
+          </div>
+        </div>
+
+        <!-- Controls -->
+        <div class="panel">
+          <div class="panel-head">
+            <span class="label">Controls</span>
+            <a href="#how" class="label dim" id="more-help">help ›</a>
+          </div>
+          <div class="ctl-list" id="controls-list">
+            <div class="ctl"><span class="keys"><kbd>←</kbd><kbd>↑</kbd><kbd>↓</kbd><kbd>→</kbd></span><span>Move</span></div>
+            <div class="ctl"><span class="keys"><kbd>CTRL</kbd><kbd>F</kbd></span><span>Shoot</span></div>
+            <div class="ctl"><span class="keys"><kbd>SPACE</kbd><kbd>C</kbd></span><span>Use</span></div>
+            <div class="ctl"><span class="keys"><kbd>SHIFT</kbd><kbd>Z</kbd></span><span>Run</span></div>
+            <div class="ctl"><span class="keys"><kbd>ALT</kbd><kbd>A</kbd></span><span>Strafe</span></div>
+            <div class="ctl"><span class="keys"><kbd>S/D</kbd></span><span>Prev/Next weapon</span></div>
+            <div class="ctl"><span class="keys"><kbd>1-9</kbd></span><span>Change weapon</span></div>
+            <div class="ctl"><span class="keys"><kbd>TAB</kbd></span><span>Map</span></div>
+          </div>
+        </div>
+
+      </aside>
+    </section>
+
+  </main>
+
+  <footer class="footer shell">
+    <div class="row">
+      <span>2026 // Doom Arena · powered by Cartesi · Freedoom</span>
+      <div>
+        <a href="#how">How it works</a>
+        <a href="https://github.com/lynoferraz/rives-barebones-doom" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <a href="https://cartesi.io" target="_blank" rel="noopener noreferrer">Cartesi</a>
+      </div>
+    </div>
+  </footer>
+
+  <!-- =====================================================
+       MODAL — How it works
+       ===================================================== -->
+  <div class="modal" id="how-modal" hidden>
+    <div class="modal-backdrop" data-close="1"></div>
+    <div class="modal-card" role="dialog" aria-labelledby="how-title" aria-modal="true">
+      <div class="modal-head">
+        <div class="left">
+          <span class="label">// protocol</span>
+          <h3 id="how-title">How the Gameplay is verified onchain</h3>
+        </div>
+        <button class="modal-close" data-close="1" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="how">
+          <div class="how-step">
+            <span class="step">STEP 01</span>
+            <h4>Play the run</h4>
+            <p>Your keystrokes hit the riv engine running the game on Linux in a Cartesi Machine on the Browser. After the session, riv generates a deterministic gameplay log.</p>
+          </div>
+          <div class="how-step">
+            <span class="step">STEP 02</span>
+            <h4>Submit to InputBox</h4>
+            <p>The gameplay is posted as an input to the Cartesi Rollups InputBox onchain.</p>
+          </div>
+          <div class="how-step">
+            <span class="step">STEP 03</span>
+            <h4>Node processes</h4>
+            <p>The Cartesi node executes your gameplay inside the Cartesi Machine. It will generate the same result as everything is deterministic.</p>
+          </div>
+          <div class="how-step">
+            <span class="step">STEP 04</span>
+            <h4>Epoch closes</h4>
+            <p>The node submits an epoch claim onchain with the root-hash of its inputs. Once the epoch is accepted, your score is set, anyone can verify it onchain.</p>
+          </div>
+        </div>
+
+        <div class="modal-meta">
+          <div>
+            <span class="label">application</span>
+            <div class="mono" id="modal-app">0xA18dC0a420aB4504e36666a65F4387574cBd80C0</div>
+          </div>
+          <div>
+            <span class="label">input box</span>
+            <div class="mono" id="modal-ibox">0x1b51e2992A2755Ba4D6F7094032DF91991a0Cfac</div>
+          </div>
+          <div>
+            <span class="label">network</span>
+            <div class="mono" id="modal-chain">base-sepolia</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>

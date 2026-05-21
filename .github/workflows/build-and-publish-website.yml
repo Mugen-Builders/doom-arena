@@ -10,7 +10,7 @@ jobs:
       run:
         working-directory: website
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up consts
         env:
@@ -35,7 +35,7 @@ jobs:
           echo Final src/consts.ts:
           cat src/consts.ts
 
-      - uses: actions/setup-node@master
+      - uses: actions/setup-node@v6
       - name: Install Dependencies
         run: npm install
 

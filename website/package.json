@@ -19,7 +19,7 @@
     "watch": "^1.0.2"
   },
   "dependencies": {
-    "@cartesi/viem": "^2.0.0-alpha.26",
+    "@cartesi/viem": "^2.0.0-alpha.29",
     "esbuild": "^0.25.1",
     "expr-eval": "^2.0.2",
     "viem": "^2.23.15"

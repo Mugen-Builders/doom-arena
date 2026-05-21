@@ -8,11 +8,11 @@ jobs:
     environment: "Cartesi Cloud Infra"
     defaults:
       run:
-        working-directory: website
+        working-directory: doom-arena-website
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Set up consts
+      - name: Set up config
         env:
           ENV_VARIABLES: >-
             EMULATOR_URL
@@ -28,14 +28,14 @@ jobs:
           NODE_URL: ${{ vars.NODE_URL }}
           INPUT_BOX_ADDRESS: ${{ vars.INPUT_BOX_ADDRESS }}
         run: |
-          rm src/consts.ts
+          rm src/config.js
           for var in $ENV_VARIABLES; do
-            echo "export const $var = '${!var}'" >> src/consts.ts
+            echo "export const $var = '${!var}'" >> src/config.js
           done
-          echo Final src/consts.ts:
-          cat src/consts.ts
+          echo Final src/config.js:
+          cat src/config.js
 
-      - uses: actions/setup-node@master
+      - uses: actions/setup-node@v6
       - name: Install Dependencies
         run: npm install
 
@@ -48,7 +48,7 @@ jobs:
         id: deployment
         uses: actions/upload-pages-artifact@v3 # or specific "vX.X.X" version tag for this action
         with:
-          path: website/dist/
+          path: doom-arena-website/dist/
           retention-days: 2
 
   # Deploy job
@@ -60,7 +60,7 @@ jobs:
       id-token: write # to verify the deployment originates from an appropriate source
     defaults:
       run:
-        working-directory: website
+        working-directory: doom-arena-website
     # Deploy to the github-pages environment
     environment:
       name: github-pages
