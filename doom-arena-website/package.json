@@ -2,7 +2,7 @@
   "name": "doom-arena",
   "version": "0.0.1",
   "scripts": {
-    "build": "node ./build.cjs && cp public/* dist && cpx src/*.{html,css,js} dist",
+    "build": "cp public/* dist && cpx src/*.{html,css} dist && node ./build.cjs",
     "dev": "cpx -wv src/*.{html,css,js} dist & cpx -wv public/*.{ico,svg,png,jpg} dist & watch 'node ./build.cjs' ./src & serve dist --cors",
     "start": "serve dist --cors"
   },
