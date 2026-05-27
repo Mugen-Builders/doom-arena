@@ -1,10 +1,10 @@
-# Rives Barebones with Doom
+# Doom Arena
 
 ```
 Cartesi Rollups Node version: 2.1.x
 ```
 
-The RiscV Entertainment System (RIVES) barebones with Doom is a proof of concept that allows users to play the [riscv-binary port of Freedoom](https://github.com/rives-io/cartridge-freedoom) on a RISC-v Cartesi Machine on the browser, submit the game moves onchain so the session will be replayed in a Cartesi Rollups App to generate a provable score.
+Doom Arena is a proof of concept that allows users to play the [riscv-binary port of Freedoom](https://github.com/rives-io/cartridge-freedoom) on a RISC-v Cartesi Machine on the browser, submit the game moves onchain so the session will be replayed in a Cartesi Rollups App to generate a provable score.
 
 DISCLAIMERS
 
@@ -22,7 +22,7 @@ Install Cartesapp:
 ```shell
 python3 -m venv .venv
 . .venv/bin/activate
-pip3 install cartesapp[dev]@git+https://github.com/prototyp3-dev/cartesapp@v1.2.1
+pip3 install cartesapp[dev]@git+https://github.com/prototyp3-dev/cartesapp@v1.2.6
 pip3 install pytest-randomly
 ```
 
@@ -66,8 +66,8 @@ To run the node with the version that was deployed on testnet you should get the
 ```shell
 rm -rf .cartesi
 mkdir -p .cartesi/image
-RIVES_DOOM_VERSION=0.0.3
-wget -qO- https://github.com/lynoferraz/rives-barebones-doom/releases/download/v${RIVES_DOOM_VERSION}/rives-barebones-doom-snapshot.tar.gz | tar zxf - -C .cartesi/image/
+DOOM_ARENA_VERSION=0.0.3
+wget -qO- https://github.com/Mugen-Builders/doom-arena/releases/download/v${DOOM_ARENA_VERSION}/doom-arena-snapshot.tar.gz | tar zxf - -C .cartesi/image/
 ```
 
 Then define the `CARTESI_AUTH_PRIVATE_KEY`, `RPC_URL`, and `RPC_WS` (additionally `APPLICATION_ADDRESS` and `CONSENSUS_ADDRESS`) environment variables. We suggest creating a .env.testnet file (and running `source .env.testnet`):
@@ -101,7 +101,7 @@ cartesapp deploy --log-level debug \
   --env=CARTESI_AUTH_PRIVATE_KEY=${CARTESI_AUTH_PRIVATE_KEY}
 ```
 
-## Interacting with Rives Barebones with Doom
+## Interacting with Doom Arena
 
 ### Using the Web Frontend
 

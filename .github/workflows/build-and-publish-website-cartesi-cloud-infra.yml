@@ -1,6 +1,6 @@
 name: build-and-publish-website-cartesi
 run-name: Building and Publishing Rives barebones with Doom website
-on: [workflow_dispatch]
+on: [push, workflow_dispatch]
 
 jobs:
   build:
