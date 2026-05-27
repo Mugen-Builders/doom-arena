@@ -15,7 +15,7 @@ export const APPLICATION_ADDRESS = "0xAD99e7c1c9bb884c7fa97d15E7fEDCeA04586abe";
 // export const APPLICATION_ADDRESS = "0x90557BEd8755d2bB1b943e6f151267d7a219B90C"; // salt 1
 // export const APPLICATION_ADDRESS = ""; // Cartesapp blank Deployment
 // export const APPLICATION_ADDRESS = "0x338709834f3A4255E4bF3DabA8d1eFCA6cBcA385"; // sepolia
-// export const APPLICATION_ADDRESS = "0xA18dC0a420aB4504e36666a65F4387574cBd80C0"; // base sepolia
+// export const APPLICATION_ADDRESS = "0xaef8aebc5a325079dd4d1ae41ac525c47dc1d9e4"; // base sepolia
 
 // Cartesi node URL
 export const NODE_URL = "http://localhost:8080";
