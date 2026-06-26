@@ -21,7 +21,7 @@ jobs:
 
       - name: Install Cartesapp
         run: |
-          pip3 install cartesapp[dev]@git+https://github.com/prototyp3-dev/cartesapp@v1.1.1
+          pip3 install cartesapp[dev]@git+https://github.com/prototyp3-dev/cartesapp@v1.4.0
 
       - name: Build with Cartesapp
         run: |
