@@ -19,14 +19,20 @@ jobs:
             CARTRIDGES_URL
             CHAIN_ID
             APPLICATION_ADDRESS
+            APPLICATION_NAME
             NODE_URL
             INPUT_BOX_ADDRESS
+            L1_RPC_URL
           EMULATOR_URL: ${{ vars.EMULATOR_URL }}
           CARTRIDGES_URL: ${{ vars.CARTRIDGES_URL }}
           CHAIN_ID: ${{ vars.CHAIN_ID }}
           APPLICATION_ADDRESS: ${{ vars.APPLICATION_ADDRESS }}
           NODE_URL: ${{ vars.NODE_URL }}
           INPUT_BOX_ADDRESS: ${{ vars.INPUT_BOX_ADDRESS }}
+          APPLICATION_NAME: ${{ vars.APPLICATION_NAME }}
+          # L1 JSON-RPC for PRT contract reads. Public repo variable — it ends up
+          # in the published bundle, so use a domain-restricted or keyless URL.
+          L1_RPC_URL: ${{ vars.L1_RPC_URL }}
         run: |
           rm src/config.js
           for var in $ENV_VARIABLES; do

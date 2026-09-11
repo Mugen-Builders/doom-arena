@@ -6,7 +6,7 @@
 // - Per-row onchain verify (validateOutput)
 // - In-canvas replay (getInput → postMessage to emulator iframe)
 // - Submit flow (rivemuOnFinish → inputBox.addInput)
-// - Rollup state (listEpochs + getLastAcceptedEpoch)
+// - Rollup state (listEpochs + getLastAcceptedEpochIndex, PRT consensus/tournaments)
 // =============================================================
 
 import {
@@ -24,14 +24,22 @@ import {
   fromHex,
 } from "viem"; // "https://esm.sh/viem@2.50.4"; //"viem";
 import { baseSepolia, anvil, sepolia, mainnet, base } from "viem/chains"; // "https://esm.sh/viem@2.50.4/chains"; //"viem/chains";
-import {
-  publicActionsL1,
-  createCartesiPublicClient,
-  walletActionsL1,
-} from "@cartesi/viem"; //"https://esm.sh/@cartesi/viem@2.0.0-alpha.29"; // "@cartesi/viem";
+// @cartesi/viem >= 2.0.0-alpha.30 dropped the L1 action sets
+// (publicActionsL1 / walletActionsL1). Nothing here used them: every L1 call in
+// this file is plain viem (simulateContract / writeContract / readContract /
+// waitForTransactionReceipt) against inline ABIs.
+import { createCartesiPublicClient } from "@cartesi/viem"; //"https://esm.sh/@cartesi/viem@2.0.0-alpha.33"; // "@cartesi/viem";
 
 import * as CFG from "./config";
 import * as CONSTS from "./consts";
+import {
+  epochStatus,
+  fetchPrtState,
+  formatBlocks,
+  describeStaging,
+  describeDispute,
+  describeTree,
+} from "./prt";
 
 const EMULATOR_URL = CFG.EMULATOR_URL || "https://emulator.rives.io";
 const CARTRIDGES_URL = CFG.CARTRIDGES_URL || "";
@@ -78,11 +86,14 @@ const cartesiPublicClient = createCartesiPublicClient({
   transport: http(`${CFG.NODE_URL}/rpc`),
 });
 
-// L1 client for validateOutput / waitForTransactionReceipt
+// L1 client for validateOutput / waitForTransactionReceipt / PRT contract reads.
+// batch:true collapses a refresh's eth_calls into few HTTP round trips, which
+// matters once per-tournament reads are added on top of a public endpoint.
+// Falls back to the chain's default RPC when L1_RPC_URL is unset.
 const l1Client = createPublicClient({
   chain: getChain(CFG.CHAIN_ID),
-  transport: http(),
-}).extend(publicActionsL1());
+  transport: http(CFG.L1_RPC_URL || undefined, { batch: true }),
+});
 
 // -------------------------------------------------------------
 // helpers
@@ -91,6 +102,14 @@ const $ = (s, p = document) => p.querySelector(s);
 const $$ = (s, p = document) => Array.from(p.querySelectorAll(s));
 
 const fmtAddrShort = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "—");
+// Node RPC values are interpolated into innerHTML below; escape them rather
+// than trusting whatever the node hands back.
+const esc = (v) =>
+  String(v ?? "").replace(
+    /[&<>"']/g,
+    (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+  );
 const fmtScore = (n) => (n == null ? "—" : Number(n).toLocaleString("en-US"));
 const fmtAge = (ts) => {
   if (!ts) return "—";
@@ -162,7 +181,7 @@ async function getWalletClient() {
     account: address,
     chain: getChain(CFG.CHAIN_ID),
     transport: custom(window.ethereum),
-  }).extend(walletActionsL1());
+  });
 }
 
 async function setupWallet() {
@@ -546,58 +565,104 @@ let LIFECYCLE_STATE = {
   fetchedAt: null,
   loading: false,
   error: null,
+  app: null, // cached cartesi_getApplication — static config
+  prt: null, // PRT view-model, null under authority/quorum
+  expanded: false,
 };
 
-function statusOf(e) {
-  const s = (e.status || e.state || "").toString().toLowerCase();
-  if (s.includes("accept")) return "accepted";
-  if (s.includes("claim")) return "pending";
-  if (s.includes("open")) return "open";
-  if (s.includes("dispute") || s.includes("rej")) return "bad";
-  return s || "open";
-}
-const indexOf = (e) => e.index ?? e.epochIndex ?? e.id ?? null;
+const APP_REF = CFG.APPLICATION_NAME || CFG.APPLICATION_ADDRESS;
+
 const inputsCount = (e) =>
   e.inputIndexUpperBound != undefined && e.inputIndexLowerBound != undefined
-    ? e.inputIndexUpperBound - e.inputIndexLowerBound
+    ? Number(e.inputIndexUpperBound) - Number(e.inputIndexLowerBound)
     : 0;
+
+const isPrt = () => LIFECYCLE_STATE.app?.consensusType === "PRT";
+
+// An epoch whose claim is settled one way or the other needs no live tracking.
+const SETTLED = new Set(["ACCEPTED", "REJECTED", "FORECLOSED"]);
 
 async function fetchLifecycle() {
   LIFECYCLE_STATE.loading = true;
   renderLifecycle();
   try {
-    const app = CFG.APPLICATION_ADDRESS;
     const safe = (p) =>
       p.then((v) => ({ ok: true, v })).catch((e) => ({ ok: false, e }));
 
+    // Application is deployment config — fetch once and keep it.
+    if (!LIFECYCLE_STATE.app) {
+      const appR = await safe(
+        cartesiPublicClient.getApplication({ application: APP_REF }),
+      );
+      if (appR.ok) LIFECYCLE_STATE.app = appR.v;
+    }
+
+    // listEpochs defaults to ASCENDING (verified against the node), so without
+    // descending:true this returned the twelve oldest epochs the node ever saw
+    // rather than current state.
     const [epochsR, lastR] = await Promise.all([
-      safe(cartesiPublicClient.listEpochs({ application: app, limit: 12 })),
-      safe(cartesiPublicClient.getLastAcceptedEpochIndex({ application: app })),
+      safe(
+        cartesiPublicClient.listEpochs({
+          application: APP_REF,
+          limit: 12,
+          descending: true,
+        }),
+      ),
+      safe(
+        cartesiPublicClient.getLastAcceptedEpochIndex({ application: APP_REF }),
+      ),
     ]);
     if (!epochsR.ok) throw epochsR.e;
 
     const epochs = Array.isArray(epochsR.v)
       ? epochsR.v
       : (epochsR.v?.data ?? []);
-    const last = lastR.ok ? lastR.v : null;
-    LIFECYCLE_STATE.lastAcceptedIndex = last;
-    LIFECYCLE_STATE.openEpoch =
-      epochs.find((e) => statusOf(e) !== "accepted") ?? null;
+    LIFECYCLE_STATE.lastAcceptedIndex = lastR.ok ? lastR.v : null;
+
+    // Newest first, so index 0 is the current epoch. The one worth showing is
+    // the newest not yet settled; if every epoch has settled, fall back to the
+    // newest so the panel is never blank.
+    const unsettled = epochs.filter(
+      (e) => !SETTLED.has(epochStatus(e).label),
+    );
+    const current = unsettled[0] ?? epochs[0] ?? null;
+    LIFECYCLE_STATE.openEpoch = current;
+
+    // Tournaments only exist under PRT. Under authority/quorum this is skipped
+    // entirely and no chain calls are issued.
+    LIFECYCLE_STATE.prt =
+      isPrt() && current
+        ? await fetchPrtState({
+            cartesiClient: cartesiPublicClient,
+            l1Client,
+            application: APP_REF,
+            consensusAddress: LIFECYCLE_STATE.app?.consensusAddress,
+            epoch: current,
+            claimStagingPeriod: LIFECYCLE_STATE.app?.claimStagingPeriod,
+            expanded: LIFECYCLE_STATE.expanded,
+          })
+        : null;
+
     LIFECYCLE_STATE.error = null;
   } catch (e) {
     console.warn("lifecycle fetch failed:", humanError(e));
     LIFECYCLE_STATE.error = humanError(e);
     LIFECYCLE_STATE.lastAcceptedIndex = null;
     LIFECYCLE_STATE.openEpoch = null;
+    LIFECYCLE_STATE.prt = null;
   }
-  LIFECYCLE_STATE.fetchedAt =
-    LIFECYCLE_STATE.openEpoch?.updatedAt ?? new Date();
+  LIFECYCLE_STATE.fetchedAt = new Date();
   LIFECYCLE_STATE.loading = false;
   renderLifecycle();
+  schedulePoll();
 }
 
+// ~2s blocks on Base Sepolia; good enough to turn a block delta into a feel.
+const BLOCK_SECONDS = 2;
+const fmtBlocks = (n) => formatBlocks(n, BLOCK_SECONDS);
+
 function renderLifecycle() {
-  const { lastAcceptedIndex, openEpoch, fetchedAt, error, loading } =
+  const { lastAcceptedIndex, openEpoch, fetchedAt, error, loading, prt, app } =
     LIFECYCLE_STATE;
 
   $("#lc-last").textContent =
@@ -608,26 +673,112 @@ function renderLifecycle() {
       ? fmtAge(fetchedAt.getTime())
       : "—";
 
+  const consensusPill = $("#lc-consensus-pill");
+  if (consensusPill) {
+    consensusPill.textContent = app?.consensusType ?? "—";
+    consensusPill.title = app?.consensusAddress
+      ? `consensus ${app.consensusAddress}`
+      : "";
+  }
+
   if (openEpoch) {
-    const idx = indexOf(openEpoch);
-    const st = statusOf(openEpoch);
-    $("#lc-current-status").textContent = st;
-    $("#lc-current-status").className = `status status-${st}`;
-    $("#lc-current-idx").textContent = `epoch #${idx}`;
+    const st = epochStatus(openEpoch);
+    $("#lc-current-status").textContent = st.label;
+    $("#lc-current-status").className = `status status-${st.tone}`;
+    $("#lc-current-idx").textContent = `epoch #${openEpoch.index}`;
     $("#lc-current-inputs").textContent = `${inputsCount(openEpoch)} inputs`;
-    $("#lc-current-age").textContent = openEpoch.timestamp
-      ? fmtAge(openEpoch.timestamp)
+    $("#lc-current-age").textContent = openEpoch.updatedAt
+      ? fmtAge(new Date(openEpoch.updatedAt).getTime())
       : "—";
     $("#lc-current").style.display = "";
   } else {
     $("#lc-current").style.display = "none";
   }
 
+  renderStaging(prt);
+  renderDispute(prt);
+  renderTree(prt);
+
   $("#lc-app-pill").textContent = error
     ? `live unreachable`
-    : fmtAddrShort(CFG.APPLICATION_ADDRESS);
+    : fmtAddrShort(app?.applicationAddress ?? CFG.APPLICATION_ADDRESS);
   $("#lc-app-pill").style.color = error ? "var(--bad)" : "";
 }
+
+function renderStaging(prt) {
+  const el = $("#lc-staging");
+  if (!el) return;
+  const d = describeStaging(prt, BLOCK_SECONDS);
+  if (!d) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  const text = $("#lc-staging-text");
+  text.textContent = d.text;
+  text.className = `mono ${d.tone === "bad" ? "status-bad" : "dim"}`;
+}
+
+function renderDispute(prt) {
+  const el = $("#lc-dispute");
+  if (!el) return;
+  const d = describeDispute(prt);
+  if (!d) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+
+  const badge = $("#lc-dispute-standing");
+  badge.textContent = d.standing.label;
+  badge.className = `status status-${d.standing.tone}`;
+  $("#lc-dispute-meta").textContent = d.meta;
+  $("#lc-dispute-toggle").textContent = LIFECYCLE_STATE.expanded
+    ? "hide tournament ▴"
+    : "show tournament ▾";
+}
+
+function renderTree(prt) {
+  const el = $("#lc-tree");
+  if (!el) return;
+  if (!prt || !prt.disputed || !LIFECYCLE_STATE.expanded) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+
+  const rows = describeTree(prt, BLOCK_SECONDS);
+  const html = rows
+    .map((r) =>
+      r.kind === "tournament"
+        ? `<div class="lc-tree-row" style="--depth:${r.depth}">
+             <span class="mono lc-tree-lvl">${esc(r.label)}</span>
+             <span class="mono dim lc-tree-id" title="${esc(r.address)}">${esc(fmtAddrShort(r.address))}</span>
+             <span class="status status-${esc(r.standing?.tone ?? "pending")}">${esc(r.standing?.label ?? "—")}</span>
+           </div>`
+        : `<div class="lc-tree-row lc-tree-match" style="--depth:${r.depth}">
+             <span class="mono dim lc-tree-id" title="${esc(r.idHash)}">${esc(fmtAddrShort(r.idHash))}</span>
+             <span class="mono lc-tree-label ${r.active ? "" : "dim"}">${esc(r.label)}</span>
+           </div>`,
+    )
+    .join("");
+
+  el.innerHTML =
+    html ||
+    `<div class="lc-tree-row dim mono">no tournament detail available</div>`;
+
+  if (!prt.chainOk) {
+    el.innerHTML += `<div class="lc-tree-row dim mono">live contract reads unavailable — showing indexed data only</div>`;
+  }
+}
+
+$("#lc-dispute-toggle")?.addEventListener("click", async () => {
+  LIFECYCLE_STATE.expanded = !LIFECYCLE_STATE.expanded;
+  renderDispute(LIFECYCLE_STATE.prt);
+  // Expanded detail needs reads the collapsed pass skipped.
+  if (LIFECYCLE_STATE.expanded) await fetchLifecycle();
+  else renderTree(LIFECYCLE_STATE.prt);
+});
 
 // =============================================================
 // CONF DISPLAY
@@ -690,10 +841,33 @@ $("#cartridge-id").title = CFG.APPLICATION_ADDRESS;
 // =============================================================
 // boot — fetch both, then poll every 60s
 // =============================================================
+// The leaderboard changes at human pace; consensus state does not. While a
+// dispute is live or a staged claim is counting down in ~2s blocks, a 60s tick
+// makes the countdown useless, so poll faster — but only then.
+//
+// Declared before the first fetchLifecycle() call: that call reaches
+// schedulePoll() only after an await, but keeping the bindings above it avoids
+// depending on that ordering.
+const POLL_IDLE = 60_000;
+const POLL_LIVE = 12_000;
+let pollTimer = null;
+
+function pollInterval() {
+  const prt = LIFECYCLE_STATE.prt;
+  if (!prt) return POLL_IDLE;
+  const counting = prt.staging && prt.staging.isOver === false;
+  const contested = prt.disputed && prt.activeMatchCount > 0;
+  return counting || contested ? POLL_LIVE : POLL_IDLE;
+}
+
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(() => {
+    fetchLeaderboard();
+    fetchLifecycle(); // reschedules itself when it settles
+  }, pollInterval());
+}
+
 setupWallet();
 fetchLeaderboard();
-fetchLifecycle();
-setInterval(() => {
-  fetchLeaderboard();
-  fetchLifecycle();
-}, 60_000);
+fetchLifecycle(); // schedules the next poll when it settles

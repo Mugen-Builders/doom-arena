@@ -118,7 +118,10 @@
         <div class="panel" id="lifecycle">
           <div class="panel-head">
             <span class="label">Rollup state</span>
-            <span class="label dim" id="lc-fetched-pill">—</span>
+            <span class="lc-head-right">
+              <span class="label dim" id="lc-consensus-pill" title="consensus mechanism">—</span>
+              <span class="label dim" id="lc-fetched-pill">—</span>
+            </span>
           </div>
 
           <div class="lc-compact-mini">
@@ -140,6 +143,24 @@
                 <span class="mono dim" id="lc-current-age">—</span>
               </div>
             </div>
+
+            <!-- PRT only; hidden unless the claim is staged -->
+            <div class="lc-staging" id="lc-staging" hidden>
+              <span class="mono dim" id="lc-staging-text">—</span>
+            </div>
+
+            <!-- PRT only; hidden unless a dispute exists -->
+            <div class="lc-dispute" id="lc-dispute" hidden>
+              <div class="lc-dispute-head">
+                <span class="status status-bad" id="lc-dispute-standing">DISPUTE</span>
+                <button class="lc-link" id="lc-dispute-toggle" type="button">
+                  show tournament ▾
+                </button>
+              </div>
+              <span class="mono dim" id="lc-dispute-meta">—</span>
+            </div>
+
+            <div class="lc-tree" id="lc-tree" hidden></div>
           </div>
 
           <div class="panel-foot">
@@ -214,7 +235,7 @@
           <div class="how-step">
             <span class="step">STEP 04</span>
             <h4>Epoch closes</h4>
-            <p>The node submits an epoch claim onchain with the root-hash of its inputs. Once the epoch is accepted, your score is set, anyone can verify it onchain.</p>
+            <p>The node submits an epoch claim onchain with the root-hash of its inputs. Under PRT consensus, anyone may challenge that claim: the disagreement is settled by an onchain tournament, which bisects the disputed computation until a single wrong step can be proven. Once the epoch is accepted, your score is set and anyone can verify it onchain.</p>
           </div>
         </div>
 

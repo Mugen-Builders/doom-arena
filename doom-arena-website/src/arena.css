@@ -504,6 +504,15 @@ h4 {
     max-height: calc(100vh - 90px);
     overflow: auto;
 }
+
+/* The viewport cap above is deliberate: the column is sticky, and a sticky
+   element taller than the viewport pins its top and leaves its lower panels
+   unreachable. Capping it and letting it scroll keeps the whole column
+   reachable.
+   Do NOT special-case the expanded tournament tree here. Releasing the cap
+   only while the tree is open inverts the behaviour — the *shorter* collapsed
+   column scrolls while the taller expanded one does not — which reads as a
+   bug. The scrollbar is themed below; consistent is better than absent. */
 @media (max-width: 1000px) {
     .side {
         position: static;
@@ -761,6 +770,132 @@ h4 {
 }
 .status-open {
     color: var(--accent);
+}
+/* statusOf() has always been able to emit "accepted"; the rule was missing, so
+   an accepted epoch rendered in the default colour. */
+.status-accepted {
+    color: var(--ok);
+}
+
+/* ============================================================
+   PRT consensus — staging, dispute, tournament tree
+   All of it is hidden unless it applies, so the panel is
+   unchanged under authority consensus.
+   ============================================================ */
+.lc-head-right {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.lc-staging,
+.lc-dispute {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 0 0;
+    border-top: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+    font-family: var(--font-mono);
+    font-size: 11px;
+}
+
+.lc-dispute-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.lc-link {
+    background: none;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+}
+.lc-link:hover {
+    text-decoration: underline;
+}
+
+.lc-tree {
+    display: grid;
+    gap: 3px;
+    padding: 8px 0 0;
+    margin-top: 8px;
+    border-top: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+    /* No overflow here on purpose. `overflow-x: auto` would force overflow-y to
+       compute to `auto` as well (a non-visible axis drags the visible one with
+       it), which nests a second scroll container inside the panel. Rows wrap
+       instead, so the tree just grows. */
+}
+
+.lc-tree-row {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 2px 8px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding-left: calc(var(--depth, 0) * 12px);
+}
+
+/* addresses and match ids stay on one line and truncate; the descriptive label
+   is what wraps when the panel is narrow */
+.lc-tree-id {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+}
+.lc-tree-label {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+/* when a long match description wraps onto its own line, keep it indented
+   under the match id rather than snapping back to the row's left edge */
+.lc-tree-match .lc-tree-label {
+    padding-left: 12px;
+}
+
+/* ============================================================
+   scrollbars
+   The sidebar can still scroll on short viewports, and the board
+   has its own overflow. The default chrome scrollbar is a bright
+   slab against this palette, so tone it down to match.
+   ============================================================ */
+* {
+    scrollbar-width: thin;
+    scrollbar-color: var(--rule) transparent;
+}
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+::-webkit-scrollbar-thumb {
+    background: var(--rule);
+    border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: var(--fg-mute);
+}
+::-webkit-scrollbar-corner {
+    background: transparent;
+}
+
+.lc-tree-lvl {
+    color: var(--fg-mute);
+    min-width: 26px;
+}
+
+.lc-tree-match::before {
+    content: "└";
+    color: var(--fg-mute);
 }
 
 .status-with-dot {
