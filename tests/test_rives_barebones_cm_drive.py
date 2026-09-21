@@ -13,10 +13,17 @@ from model import *
 # test application setup
 @pytest.fixture(scope='module')
 def app_client() -> TestClient:
-    os.environ['MACHINE_CONFIG'] = '{"init":["dd if=/dev/zero of=/run/zeros bs=1K count=121528"]}'
+    old_machine_config_str = os.getenv('MACHINE_CONFIG')
+    old_machine_config = {}
+    if old_machine_config_str is not None:
+        old_machine_config = json.loads(old_machine_config_str)
+    os.environ['MACHINE_CONFIG'] = json.dumps (old_machine_config|{"init":["dd if=/dev/zero of=/run/zeros bs=1K count=121528"]})
     client = TestClient()
     yield client
-    del os.environ['MACHINE_CONFIG']
+    if old_machine_config_str is None:
+        del os.environ['MACHINE_CONFIG']
+    else:
+        os.environ['MACHINE_CONFIG'] = old_machine_config_str
 
 # test payload
 @pytest.fixture()

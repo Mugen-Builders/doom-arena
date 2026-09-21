@@ -1,13 +1,15 @@
 {
   "name": "doom-arena",
   "version": "0.0.1",
+  "type": "module",
   "scripts": {
     "build": "node ./build.cjs && cp public/* dist && cpx src/*.{html,css} dist",
     "dev": "cpx -wv src/*.{html,css} dist & cpx -wv public/*.{ico,svg,png,jpg} dist & watch 'node ./build.cjs' ./src & serve dist --cors",
-    "start": "serve dist --cors"
+    "start": "serve dist --cors",
+    "test": "node --test \"test/**/*.test.mjs\""
   },
   "dependencies": {
-    "@cartesi/viem": "2.0.0-alpha.29",
+    "@cartesi/viem": "2.0.0-alpha.33",
     "viem": "^2.50.4"
   },
   "devDependencies": {

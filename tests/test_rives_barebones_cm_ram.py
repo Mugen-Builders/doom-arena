@@ -13,10 +13,17 @@ from model import *
 # test application setup
 @pytest.fixture(scope='module')
 def app_client() -> TestClient:
-    os.environ['MACHINE_CONFIG'] = '{"ram_length":"32Mi"}'
+    old_machine_config_str = os.getenv('MACHINE_CONFIG')
+    old_machine_config = {}
+    if old_machine_config_str is not None:
+        old_machine_config = json.loads(old_machine_config_str)
+    os.environ['MACHINE_CONFIG'] = json.dumps (old_machine_config|{"ram_length":"32Mi"})
     client = TestClient()
     yield client
-    del os.environ['MACHINE_CONFIG']
+    if old_machine_config_str is None:
+        del os.environ['MACHINE_CONFIG']
+    else:
+        os.environ['MACHINE_CONFIG'] = old_machine_config_str
 
 # test payload
 @pytest.fixture()

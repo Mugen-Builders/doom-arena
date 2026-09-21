@@ -1,7 +1,7 @@
 # syntax=docker.io/docker/dockerfile:1
 
 ARG IMAGE_NAME=riscv64/alpine
-ARG IMAGE_TAG=3.22.1
+ARG IMAGE_TAG=3.22.3
 
 FROM ${IMAGE_NAME}:${IMAGE_TAG} AS base
 
@@ -16,9 +16,9 @@ EOF
 FROM base AS guesttools
 
 # Install guest tools
-ARG MACHINE_GUEST_TOOLS_VERSION=0.17.1-r1
-ADD --chmod=644 https://edubart.github.io/linux-packages/apk/keys/cartesi-apk-key.rsa.pub /etc/apk/keys/cartesi-apk-key.rsa.pub
-RUN echo "https://edubart.github.io/linux-packages/apk/stable" >> /etc/apk/repositories
+ARG MACHINE_GUEST_TOOLS_VERSION=0.18.0-r1
+ADD --chmod=644 https://cartesi.github.io/linux-packages/apk/keys/cartesi-apk-key.rsa.pub /etc/apk/keys/cartesi-apk-key.rsa.pub
+RUN echo "https://cartesi.github.io/linux-packages/apk/stable" >> /etc/apk/repositories
 RUN apk update && apk add cartesi-machine-guest-tools=$MACHINE_GUEST_TOOLS_VERSION
 
 FROM base AS dist
@@ -26,6 +26,12 @@ FROM base AS dist
 # Install guest tools
 COPY --from=guesttools /usr/sbin/cartesi-init /usr/sbin/cartesi-init
 COPY --from=guesttools /usr/sbin/xhalt /usr/sbin/xhalt
+COPY --from=guesttools /usr/bin/flashdrive /usr/bin/flashdrive
+COPY --from=guesttools /usr/bin/memoryrange /usr/bin/memoryrange
+# COPY --from=guesttools /usr/bin/nvram /usr/bin/nvram
+# COPY --from=guesttools /usr/bin/readmmap /usr/bin/readmmap
+# COPY --from=guesttools /usr/bin/hex /usr/bin/hex
+# COPY --from=guesttools /usr/bin/ioctl-echo-loop /usr/bin/ioctl-echo-loop
 
 # Install Riv
 ARG RIV_VERSION=0.3-rc16

@@ -23,8 +23,24 @@ export const NODE_URL = "http://localhost:8080";
 // export const NODE_URL = "https://doom-sepolia-bare.rives.io"; // rives infra
 // export const NODE_URL = "https://base-sepolia.rollups.cartesi.io/v2"; // cartesi cloud infra
 
-// Cartesi InputBox contract address (constant across deployments)
+// Cartesi InputBox contract address
+// NOTE: not actually constant across deployments — cross-check against
+// cartesi_getApplication().inputBoxAddress for the node you point at.
+// The Base Sepolia cloud node reports 0x346b3df038fe9f8380071ec6514d5a83ad143939.
 export const INPUT_BOX_ADDRESS = "0x1b51e2992A2755Ba4D6F7094032DF91991a0Cfac";
+
+// Application name as registered on the node. When set it is used instead of
+// APPLICATION_ADDRESS for node RPC lookups (the node resolves either).
+export const APPLICATION_NAME = "";
+// export const APPLICATION_NAME = "doom_arena"; // cartesi cloud infra
+
+// L1 JSON-RPC endpoint for contract reads (PRT tournament state, validateOutput).
+// Leave empty to use the chain's default public RPC — fine for anvil, but Base
+// Sepolia's default will rate-limit once tournament reads are polling.
+// This is baked into the published bundle, so use a domain-restricted or
+// keyless endpoint, never a secret one.
+export const L1_RPC_URL = "";
+// export const L1_RPC_URL = "https://sepolia.base.org";
 
 // <script>
 //   window.__ARENA_CONFIG = {
