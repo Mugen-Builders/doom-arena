@@ -17,16 +17,23 @@ export const APPLICATION_ADDRESS = "0xAD99e7c1c9bb884c7fa97d15E7fEDCeA04586abe";
 // export const APPLICATION_ADDRESS = "0x338709834f3A4255E4bF3DabA8d1eFCA6cBcA385"; // sepolia
 // export const APPLICATION_ADDRESS = "0xaef8aebc5a325079dd4d1ae41ac525c47dc1d9e4"; // base sepolia
 
-// Cartesi node URL
+// Cartesi node URL (JSON-RPC is served at `${NODE_URL}/rpc`).
+// Requires rollups-node `next/2.0` with PR #798 shapes; the site checks
+// cartesi_getNodeInfo at startup and refuses older nodes. Browsers only get an
+// answer when the node allows this site's exact origin:
+//   CARTESI_JSONRPC_CORS_ALLOWED_ORIGINS=http://localhost:3000
+// (CORS is off by default; wildcard is not supported.)
 export const NODE_URL = "http://localhost:8080";
 // export const NODE_URL = "http://127.0.0.1:6751";
 // export const NODE_URL = "https://doom-sepolia-bare.rives.io"; // rives infra
 // export const NODE_URL = "https://base-sepolia.rollups.cartesi.io/v2"; // cartesi cloud infra
 
 // Cartesi InputBox contract address
-// NOTE: not actually constant across deployments — cross-check against
-// cartesi_getApplication().inputBoxAddress for the node you point at.
-// The Base Sepolia cloud node reports 0x346b3df038fe9f8380071ec6514d5a83ad143939.
+// NOTE: not constant across deployments or contract releases. The site
+// cross-checks this, CHAIN_ID and APPLICATION_ADDRESS against what the node
+// reports (cartesi_getNodeInfo / cartesi_getApplication) and, on a mismatch,
+// shows it in the Rollup-state panel and disables submissions rather than
+// sending runs to an InputBox the node is not watching.
 export const INPUT_BOX_ADDRESS = "0x1b51e2992A2755Ba4D6F7094032DF91991a0Cfac";
 
 // Application name as registered on the node. When set it is used instead of

@@ -2,11 +2,16 @@
 // DOOM ARENA — main app
 // =============================================================
 // - Wallet connect (window.ethereum + viem walletClient)
-// - Live leaderboard (cartesi listOutputs → decode Notice)
+// - Live leaderboard (cartesi_listOutputs, notices only, paged → decode)
 // - Per-row onchain verify (validateOutput)
-// - In-canvas replay (getInput → postMessage to emulator iframe)
+// - In-canvas replay (cartesi_getInput → postMessage to emulator iframe)
 // - Submit flow (rivemuOnFinish → inputBox.addInput)
-// - Rollup state (listEpochs + getLastAcceptedEpochIndex, PRT consensus/tournaments)
+// - Rollup state (cartesi_listEpochs + getLastAcceptedEpochIndex, PRT
+//   consensus/tournaments from node snapshots)
+//
+// Node: rollups-node next/2.0 (PR #798 shapes). Talks to it through the thin
+// client in ./nodeRpc; the node must allow this site's origin via
+// CARTESI_JSONRPC_CORS_ALLOWED_ORIGINS or the browser never sees a reply.
 // =============================================================
 
 import {
@@ -24,18 +29,25 @@ import {
   fromHex,
 } from "viem"; // "https://esm.sh/viem@2.50.4"; //"viem";
 import { baseSepolia, anvil, sepolia, mainnet, base } from "viem/chains"; // "https://esm.sh/viem@2.50.4/chains"; //"viem/chains";
-// @cartesi/viem >= 2.0.0-alpha.30 dropped the L1 action sets
-// (publicActionsL1 / walletActionsL1). Nothing here used them: every L1 call in
-// this file is plain viem (simulateContract / writeContract / readContract /
-// waitForTransactionReceipt) against inline ABIs.
-import { createCartesiPublicClient } from "@cartesi/viem"; //"https://esm.sh/@cartesi/viem@2.0.0-alpha.33"; // "@cartesi/viem";
 
 import * as CFG from "./config";
 import * as CONSTS from "./consts";
 import {
+  createNodeClient,
+  listAllOutputs,
+  OUTPUT_SELECTOR,
+  NodeRpcError,
+  NodeShapeError,
+  NodeTransportError,
+  isNotFound,
+  isConfigError,
+  isTransient,
+  isUnsupportedNode,
+} from "./nodeRpc";
+import {
   epochStatus,
+  NON_TERMINAL_PAST_OPEN,
   fetchPrtState,
-  formatBlocks,
   describeStaging,
   describeDispute,
   describeTree,
@@ -81,10 +93,15 @@ export function getChain(chainId) {
   return chain;
 }
 
-// Cartesi-aware L2 client (listEpochs, listOutputs, getInput, …)
-const cartesiPublicClient = createCartesiPublicClient({
-  transport: http(`${CFG.NODE_URL}/rpc`),
-});
+// rollups-node JSON-RPC (listEpochs, listOutputs, getInput, …)
+const nodeClient = createNodeClient({ url: `${CFG.NODE_URL}/rpc` });
+
+// The node resolves either the registered name or the address.
+const APP_REF = CFG.APPLICATION_NAME || CFG.APPLICATION_ADDRESS;
+
+// CFG.CHAIN_ID may be a hex string or a number.
+const CFG_CHAIN_ID =
+  typeof CFG.CHAIN_ID === "string" ? fromHex(CFG.CHAIN_ID, "number") : CFG.CHAIN_ID;
 
 // L1 client for validateOutput / waitForTransactionReceipt / PRT contract reads.
 // batch:true collapses a refresh's eth_calls into few HTTP round trips, which
@@ -122,8 +139,12 @@ const fmtAge = (ts) => {
   return `${Math.floor(diff / 86400)}d ago`;
 };
 
-const humanError = (e) =>
-  e?.details || e?.shortMessage || e?.message?.split("\n")[0] || String(e);
+const humanError = (e) => {
+  if (e instanceof NodeRpcError) return `node: ${e.rpcMessage} (${e.code})`;
+  if (e instanceof NodeShapeError) return `node: unexpected response at ${e.field}`;
+  if (e instanceof NodeTransportError) return `node unreachable: ${e.message.split(": ").slice(1).join(": ")}`;
+  return e?.details || e?.shortMessage || e?.message?.split("\n")[0] || String(e);
+};
 
 // =============================================================
 // EMULATOR
@@ -163,14 +184,14 @@ async function getWalletClient() {
   if (!window.ethereum) return null;
   const chainIdHex = await window.ethereum.request({ method: "eth_chainId" });
   const currentChainId = fromHex(chainIdHex, "number");
-  if (currentChainId !== CFG.CHAIN_ID) {
+  if (currentChainId !== CFG_CHAIN_ID) {
     try {
       await window.ethereum.request({
         method: "wallet_switchEthereumChain",
-        params: [{ chainId: CFG.CHAIN_ID.toString(16) }],
+        params: [{ chainId: toHex(CFG_CHAIN_ID) }],
       });
     } catch (_) {
-      throw new Error(`Wrong network — switch to ${baseSepolia.name}`);
+      throw new Error(`Wrong network — switch to ${getChain(CFG_CHAIN_ID)?.name ?? CFG_CHAIN_ID}`);
     }
   }
   const [address] = await window.ethereum.request({
@@ -240,6 +261,10 @@ const inputBoxAbi = parseAbi([
 ]);
 
 async function submitGameplay(payload) {
+  // A stale config.js would send the run to an InputBox the node is not
+  // watching; that loses the run silently. Refuse instead.
+  if (LIFECYCLE_STATE.mismatch.length)
+    throw new Error(`config mismatch — ${LIFECYCLE_STATE.mismatch[0]}`);
   if (!WALLET_CLIENT) WALLET_CLIENT = await getWalletClient();
   if (!WALLET_CLIENT) throw new Error("wallet not connected");
 
@@ -296,14 +321,21 @@ const ICON_PLAY = `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M5 3 L1
 // =============================================================
 let BOARD = [];
 let BOARD_ERROR = null;
+let BOARD_TOTAL = null; // node-side notice count, only when the cap truncated
+let BOARD_FATAL = false; // config error: polling the board again cannot help
 let SELECTED_RUN_IDX = null;
 let VERIFY_STATE = {};
+
+// Newest 2,000 notices are enough for a leaderboard; beyond that the board
+// says "top N of M". 20 pages of 100 stay well inside the node's per-request
+// and per-batch budgets.
+const BOARD_CAP = 2000;
+const BOARD_PAGE = 100;
 
 function decodeVerificationNotice(output) {
   try {
     const decodedData = output.decodedData || {};
-    const type = String(decodedData.type || "").toLowerCase();
-    if (type !== "notice") return null;
+    if (decodedData.type !== "Notice") return null;
     const payload = decodedData.payload;
     if (!payload || !isHex(payload)) return null;
     const decoded = decodeAbiParameters(
@@ -331,12 +363,18 @@ function decodeVerificationNotice(output) {
 }
 
 async function fetchLeaderboard() {
+  if (BOARD_FATAL) return;
   try {
-    const res = await cartesiPublicClient.listOutputs({
-      application: CFG.APPLICATION_ADDRESS,
+    // Notices only (the node filters by selector), newest first, paged.
+    const res = await listAllOutputs(nodeClient, {
+      application: APP_REF,
+      outputType: OUTPUT_SELECTOR.Notice,
+      descending: true,
+      pageSize: BOARD_PAGE,
+      cap: BOARD_CAP,
     });
-    const outputs = Array.isArray(res) ? res : (res?.data ?? []);
-    const notices = outputs.map(decodeVerificationNotice).filter(Boolean);
+    BOARD_TOTAL = res.truncated ? res.totalCount : null;
+    const notices = res.data.map(decodeVerificationNotice).filter(Boolean);
     notices.sort((a, b) => {
       const d = Number(b.score - a.score);
       return d !== 0 ? d : Number(a.timestamp - b.timestamp);
@@ -354,8 +392,17 @@ async function fetchLeaderboard() {
     BOARD_ERROR = null;
   } catch (e) {
     console.warn("leaderboard fetch failed:", humanError(e));
-    BOARD = [];
     BOARD_ERROR = humanError(e);
+    if (isConfigError(e) || isUnsupportedNode(e)) {
+      // Wrong app name/address or wrong node generation: retrying is noise.
+      BOARD = [];
+      BOARD_TOTAL = null;
+      BOARD_FATAL = true;
+    } else if (!isTransient(e)) {
+      BOARD = [];
+      BOARD_TOTAL = null;
+    }
+    // transient: keep the last good board under the error note
   }
   renderBoard();
 }
@@ -431,7 +478,9 @@ function renderBoard() {
     board.appendChild(row);
   });
   $("#board-count").textContent =
-    `${BOARD.length} run${BOARD.length === 1 ? "" : "s"}`;
+    BOARD_TOTAL != null
+      ? `top ${BOARD.length} of ${BOARD_TOTAL} runs`
+      : `${BOARD.length} run${BOARD.length === 1 ? "" : "s"}`;
 }
 
 async function verifyRow(i) {
@@ -482,10 +531,11 @@ async function loadReplay(i) {
   setStatus(`loading replay · input #${r.inputIndex}`);
 
   try {
-    const res = await cartesiPublicClient.getInput({
-      application: CFG.APPLICATION_ADDRESS,
+    const res = await nodeClient.getInput({
+      application: APP_REF,
       inputIndex: r.inputIndex,
     });
+    if (!res.decodedData?.payload) throw new Error("input has no decoded payload");
     const inputBytes = toBytes(res.decodedData.payload);
     // Strip the first 32 bytes (outhash) — what remains is the gameplay tape.
     const tape = inputBytes.slice(32);
@@ -560,8 +610,13 @@ $("#rp-next")?.addEventListener("click", () => {
 // LIFECYCLE
 // =============================================================
 let LIFECYCLE_STATE = {
+  nodeInfo: null, // cartesi_getNodeInfo — the startup gate
+  unsupported: null, // message when the node is not the generation we target
+  fatal: null, // config error from the node: polling cannot fix it
+  mismatch: [], // config.js vs node disagreements; non-empty blocks submit
   lastAcceptedIndex: null,
-  openEpoch: null,
+  currentEpoch: null, // newest epoch — where inputs go
+  settlingEpoch: null, // oldest epoch past OPEN and not settled — where consensus works
   fetchedAt: null,
   loading: false,
   error: null,
@@ -570,8 +625,6 @@ let LIFECYCLE_STATE = {
   expanded: false,
 };
 
-const APP_REF = CFG.APPLICATION_NAME || CFG.APPLICATION_ADDRESS;
-
 const inputsCount = (e) =>
   e.inputIndexUpperBound != undefined && e.inputIndexLowerBound != undefined
     ? Number(e.inputIndexUpperBound) - Number(e.inputIndexLowerBound)
@@ -579,91 +632,137 @@ const inputsCount = (e) =>
 
 const isPrt = () => LIFECYCLE_STATE.app?.consensusType === "PRT";
 
-// An epoch whose claim is settled one way or the other needs no live tracking.
-const SETTLED = new Set(["ACCEPTED", "REJECTED", "FORECLOSED"]);
+const sameAddr = (a, b) =>
+  !!a && !!b && String(a).toLowerCase() === String(b).toLowerCase();
+
+// What config.js says vs what the node says. Any disagreement means the bundle
+// was built for another deployment; see submitGameplay().
+function crossCheckConfig() {
+  const { nodeInfo, app } = LIFECYCLE_STATE;
+  const out = [];
+  if (nodeInfo && nodeInfo.chainId !== CFG_CHAIN_ID)
+    out.push(`node is on chain ${nodeInfo.chainId}, site is configured for ${CFG_CHAIN_ID}`);
+  if (app && !sameAddr(app.inputBoxAddress, CFG.INPUT_BOX_ADDRESS))
+    out.push(`node InputBox is ${app.inputBoxAddress}, site has ${CFG.INPUT_BOX_ADDRESS}`);
+  if (app && !sameAddr(app.applicationAddress, CFG.APPLICATION_ADDRESS))
+    out.push(`node application is ${app.applicationAddress}, site has ${CFG.APPLICATION_ADDRESS}`);
+  LIFECYCLE_STATE.mismatch = out;
+}
+
+// Polling cadence. The leaderboard changes at human pace; consensus state does
+// not. While a dispute is live or a staged claim is counting down in ~2s
+// blocks, a 60s tick makes the countdown useless, so poll faster — but only
+// then. Transient node trouble (timeouts, oversized replies, network) doubles
+// the interval per failure up to POLL_MAX and resets on success.
+const POLL_IDLE = 60_000;
+const POLL_LIVE = 12_000;
+const POLL_MAX = 300_000;
+let pollBackoff = 1;
 
 async function fetchLifecycle() {
+  if (LIFECYCLE_STATE.unsupported || LIFECYCLE_STATE.fatal) return;
   LIFECYCLE_STATE.loading = true;
   renderLifecycle();
   try {
     const safe = (p) =>
       p.then((v) => ({ ok: true, v })).catch((e) => ({ ok: false, e }));
 
-    // Application is deployment config — fetch once and keep it.
-    if (!LIFECYCLE_STATE.app) {
-      const appR = await safe(
-        cartesiPublicClient.getApplication({ application: APP_REF }),
-      );
-      if (appR.ok) LIFECYCLE_STATE.app = appR.v;
+    // Startup gate: a node without cartesi_getNodeInfo is an older generation
+    // whose payloads we no longer parse. Say so once and stop.
+    if (!LIFECYCLE_STATE.nodeInfo) {
+      LIFECYCLE_STATE.nodeInfo = await nodeClient.getNodeInfo();
     }
 
-    // listEpochs defaults to ASCENDING (verified against the node), so without
-    // descending:true this returned the twelve oldest epochs the node ever saw
-    // rather than current state.
-    const [epochsR, lastR] = await Promise.all([
+    // Application is deployment config — fetch once and keep it.
+    if (!LIFECYCLE_STATE.app) {
+      LIFECYCLE_STATE.app = await nodeClient.getApplication({ application: APP_REF });
+      crossCheckConfig();
+    }
+
+    // Two views of the epoch list: the newest epoch (collecting inputs) and
+    // the oldest one consensus is still working on. Under PRT the tournament
+    // hangs off the latter; the former is usually just OPEN.
+    const [newestR, settlingR, lastR] = await Promise.all([
+      safe(nodeClient.listEpochs({ application: APP_REF, descending: true, limit: 1 })),
       safe(
-        cartesiPublicClient.listEpochs({
+        nodeClient.listEpochs({
           application: APP_REF,
-          limit: 12,
-          descending: true,
+          status: NON_TERMINAL_PAST_OPEN,
+          descending: false,
+          limit: 1,
         }),
       ),
-      safe(
-        cartesiPublicClient.getLastAcceptedEpochIndex({ application: APP_REF }),
-      ),
+      safe(nodeClient.getLastAcceptedEpochIndex({ application: APP_REF })),
     ]);
-    if (!epochsR.ok) throw epochsR.e;
+    if (!newestR.ok) throw newestR.e;
+    if (!settlingR.ok) throw settlingR.e;
 
-    const epochs = Array.isArray(epochsR.v)
-      ? epochsR.v
-      : (epochsR.v?.data ?? []);
-    LIFECYCLE_STATE.lastAcceptedIndex = lastR.ok ? lastR.v : null;
+    LIFECYCLE_STATE.currentEpoch = newestR.v.data[0] ?? null;
+    LIFECYCLE_STATE.settlingEpoch = settlingR.v.data[0] ?? null;
 
-    // Newest first, so index 0 is the current epoch. The one worth showing is
-    // the newest not yet settled; if every epoch has settled, fall back to the
-    // newest so the panel is never blank.
-    const unsettled = epochs.filter(
-      (e) => !SETTLED.has(epochStatus(e).label),
-    );
-    const current = unsettled[0] ?? epochs[0] ?? null;
-    LIFECYCLE_STATE.openEpoch = current;
+    // "No accepted epoch yet" is a state, not an error.
+    if (lastR.ok) LIFECYCLE_STATE.lastAcceptedIndex = lastR.v;
+    else if (isNotFound(lastR.e)) LIFECYCLE_STATE.lastAcceptedIndex = null;
+    else throw lastR.e;
 
-    // Tournaments only exist under PRT. Under authority/quorum this is skipped
-    // entirely and no chain calls are issued.
+    // Tournaments only exist under PRT and only for a sealed epoch. Under
+    // authority/quorum this is skipped entirely and no chain calls are issued.
+    const settling = LIFECYCLE_STATE.settlingEpoch;
     LIFECYCLE_STATE.prt =
-      isPrt() && current
+      isPrt() && settling
         ? await fetchPrtState({
-            cartesiClient: cartesiPublicClient,
+            nodeClient,
             l1Client,
             application: APP_REF,
             consensusAddress: LIFECYCLE_STATE.app?.consensusAddress,
-            epoch: current,
+            epoch: settling,
             claimStagingPeriod: LIFECYCLE_STATE.app?.claimStagingPeriod,
-            expanded: LIFECYCLE_STATE.expanded,
           })
         : null;
 
     LIFECYCLE_STATE.error = null;
+    pollBackoff = 1;
   } catch (e) {
     console.warn("lifecycle fetch failed:", humanError(e));
-    LIFECYCLE_STATE.error = humanError(e);
-    LIFECYCLE_STATE.lastAcceptedIndex = null;
-    LIFECYCLE_STATE.openEpoch = null;
-    LIFECYCLE_STATE.prt = null;
+    if (isUnsupportedNode(e)) {
+      LIFECYCLE_STATE.unsupported = `unsupported node — this site needs rollups-node next/2.0 (${humanError(e)})`;
+    } else if (isConfigError(e)) {
+      LIFECYCLE_STATE.fatal = humanError(e);
+    } else if (isTransient(e)) {
+      // Keep the last good picture on screen; just note the trouble and slow down.
+      LIFECYCLE_STATE.error = humanError(e);
+      pollBackoff = Math.min(pollBackoff * 2, POLL_MAX / POLL_IDLE);
+    } else {
+      LIFECYCLE_STATE.error = humanError(e);
+      LIFECYCLE_STATE.lastAcceptedIndex = null;
+      LIFECYCLE_STATE.currentEpoch = null;
+      LIFECYCLE_STATE.settlingEpoch = null;
+      LIFECYCLE_STATE.prt = null;
+    }
   }
   LIFECYCLE_STATE.fetchedAt = new Date();
   LIFECYCLE_STATE.loading = false;
   renderLifecycle();
-  schedulePoll();
+  if (!LIFECYCLE_STATE.unsupported && !LIFECYCLE_STATE.fatal) schedulePoll();
 }
 
 // ~2s blocks on Base Sepolia; good enough to turn a block delta into a feel.
 const BLOCK_SECONDS = 2;
-const fmtBlocks = (n) => formatBlocks(n, BLOCK_SECONDS);
 
 function renderLifecycle() {
-  const { lastAcceptedIndex, openEpoch, fetchedAt, error, loading, prt, app } =
-    LIFECYCLE_STATE;
+  const {
+    lastAcceptedIndex,
+    currentEpoch,
+    settlingEpoch,
+    fetchedAt,
+    error,
+    loading,
+    prt,
+    app,
+    unsupported,
+    fatal,
+    mismatch,
+  } = LIFECYCLE_STATE;
 
   $("#lc-last").textContent =
     lastAcceptedIndex == null ? "—" : `#${lastAcceptedIndex}`;
@@ -681,28 +780,72 @@ function renderLifecycle() {
       : "";
   }
 
-  if (openEpoch) {
-    const st = epochStatus(openEpoch);
+  if (currentEpoch) {
+    const st = epochStatus(currentEpoch);
     $("#lc-current-status").textContent = st.label;
     $("#lc-current-status").className = `status status-${st.tone}`;
-    $("#lc-current-idx").textContent = `epoch #${openEpoch.index}`;
-    $("#lc-current-inputs").textContent = `${inputsCount(openEpoch)} inputs`;
-    $("#lc-current-age").textContent = openEpoch.updatedAt
-      ? fmtAge(new Date(openEpoch.updatedAt).getTime())
+    $("#lc-current-idx").textContent = `epoch #${currentEpoch.index}`;
+    $("#lc-current-inputs").textContent = `${inputsCount(currentEpoch)} inputs`;
+    $("#lc-current-age").textContent = currentEpoch.updatedAt
+      ? fmtAge(new Date(currentEpoch.updatedAt).getTime())
       : "—";
     $("#lc-current").style.display = "";
   } else {
     $("#lc-current").style.display = "none";
   }
 
+  // The epoch consensus is working on, when it is not the one shown above.
+  const settlingEl = $("#lc-settling");
+  if (settlingEl) {
+    const show =
+      settlingEpoch && (!currentEpoch || settlingEpoch.index !== currentEpoch.index);
+    settlingEl.hidden = !show;
+    if (show) {
+      const st = epochStatus(settlingEpoch);
+      $("#lc-settling-idx").textContent = `settling epoch #${settlingEpoch.index}`;
+      $("#lc-settling-status").textContent = st.label;
+      $("#lc-settling-status").className = `status status-${st.tone}`;
+    }
+  }
+
   renderStaging(prt);
   renderDispute(prt);
   renderTree(prt);
 
-  $("#lc-app-pill").textContent = error
+  // One line for whatever the operator must know: an unsupported node, a
+  // config error, a config mismatch, or transient trouble.
+  const note = $("#lc-note");
+  if (note) {
+    let text = null;
+    let tone = "bad";
+    if (unsupported) text = unsupported;
+    else if (fatal) text = `node rejected the request — ${fatal}`;
+    else if (mismatch.length)
+      text = `config mismatch · submissions disabled · ${mismatch.join(" · ")}`;
+    else if (error) {
+      text = `node trouble — ${error}${pollBackoff > 1 ? ` · retrying in ${Math.round(pollInterval() / 1000)}s` : ""}`;
+      tone = "warn";
+    }
+    note.hidden = !text;
+    note.textContent = text ?? "";
+    note.className = `lc-note mono status-${tone}`;
+  }
+  if (mismatch.length) setStatus("config mismatch — submissions disabled", "bad");
+
+  const unreachable = !!(error || unsupported || fatal);
+  $("#lc-app-pill").textContent = unreachable
     ? `live unreachable`
     : fmtAddrShort(app?.applicationAddress ?? CFG.APPLICATION_ADDRESS);
-  $("#lc-app-pill").style.color = error ? "var(--bad)" : "";
+  $("#lc-app-pill").style.color = unreachable ? "var(--bad)" : "";
+
+  // The How-modal shows both values when they differ, so the operator can see
+  // which side is stale.
+  const ibox = $("#modal-ibox");
+  if (ibox && app?.inputBoxAddress) {
+    ibox.textContent = sameAddr(app.inputBoxAddress, CFG.INPUT_BOX_ADDRESS)
+      ? fmtAddrShort(CFG.INPUT_BOX_ADDRESS)
+      : `site ${fmtAddrShort(CFG.INPUT_BOX_ADDRESS)} · node ${fmtAddrShort(app.inputBoxAddress)}`;
+  }
 }
 
 function renderStaging(prt) {
@@ -716,7 +859,7 @@ function renderStaging(prt) {
   el.hidden = false;
   const text = $("#lc-staging-text");
   text.textContent = d.text;
-  text.className = `mono ${d.tone === "bad" ? "status-bad" : "dim"}`;
+  text.className = `mono ${d.tone === "bad" ? "status-bad" : d.tone === "ok" ? "status-ok" : "dim"}`;
 }
 
 function renderDispute(prt) {
@@ -749,35 +892,33 @@ function renderTree(prt) {
 
   const rows = describeTree(prt, BLOCK_SECONDS);
   const html = rows
-    .map((r) =>
-      r.kind === "tournament"
-        ? `<div class="lc-tree-row" style="--depth:${r.depth}">
+    .map((r) => {
+      if (r.kind === "tournament")
+        return `<div class="lc-tree-row" style="--depth:${r.depth}">
              <span class="mono lc-tree-lvl">${esc(r.label)}</span>
              <span class="mono dim lc-tree-id" title="${esc(r.address)}">${esc(fmtAddrShort(r.address))}</span>
              <span class="status status-${esc(r.standing?.tone ?? "pending")}">${esc(r.standing?.label ?? "—")}</span>
-           </div>`
-        : `<div class="lc-tree-row lc-tree-match" style="--depth:${r.depth}">
+           </div>`;
+      if (r.kind === "match")
+        return `<div class="lc-tree-row lc-tree-match" style="--depth:${r.depth}">
              <span class="mono dim lc-tree-id" title="${esc(r.idHash)}">${esc(fmtAddrShort(r.idHash))}</span>
              <span class="mono lc-tree-label ${r.active ? "" : "dim"}">${esc(r.label)}</span>
-           </div>`,
-    )
+           </div>`;
+      return `<div class="lc-tree-row dim mono">${esc(r.label)}</div>`;
+    })
     .join("");
 
   el.innerHTML =
     html ||
     `<div class="lc-tree-row dim mono">no tournament detail available</div>`;
-
-  if (!prt.chainOk) {
-    el.innerHTML += `<div class="lc-tree-row dim mono">live contract reads unavailable — showing indexed data only</div>`;
-  }
 }
 
-$("#lc-dispute-toggle")?.addEventListener("click", async () => {
+// Everything the tree shows arrives with the collapsed fetch, so the toggle is
+// a pure re-render.
+$("#lc-dispute-toggle")?.addEventListener("click", () => {
   LIFECYCLE_STATE.expanded = !LIFECYCLE_STATE.expanded;
   renderDispute(LIFECYCLE_STATE.prt);
-  // Expanded detail needs reads the collapsed pass skipped.
-  if (LIFECYCLE_STATE.expanded) await fetchLifecycle();
-  else renderTree(LIFECYCLE_STATE.prt);
+  renderTree(LIFECYCLE_STATE.prt);
 });
 
 // =============================================================
@@ -839,25 +980,20 @@ $("#cartridge-id").textContent = fmtAddrShort(CFG.APPLICATION_ADDRESS);
 $("#cartridge-id").title = CFG.APPLICATION_ADDRESS;
 
 // =============================================================
-// boot — fetch both, then poll every 60s
+// boot — fetch both, then poll (cadence: see POLL_* above)
 // =============================================================
-// The leaderboard changes at human pace; consensus state does not. While a
-// dispute is live or a staged claim is counting down in ~2s blocks, a 60s tick
-// makes the countdown useless, so poll faster — but only then.
-//
-// Declared before the first fetchLifecycle() call: that call reaches
-// schedulePoll() only after an await, but keeping the bindings above it avoids
-// depending on that ordering.
-const POLL_IDLE = 60_000;
-const POLL_LIVE = 12_000;
 let pollTimer = null;
 
 function pollInterval() {
   const prt = LIFECYCLE_STATE.prt;
-  if (!prt) return POLL_IDLE;
-  const counting = prt.staging && prt.staging.isOver === false;
-  const contested = prt.disputed && prt.activeMatchCount > 0;
-  return counting || contested ? POLL_LIVE : POLL_IDLE;
+  let base = POLL_IDLE;
+  if (prt) {
+    const counting = prt.staging && prt.staging.isOver === false;
+    const contested = prt.disputed && prt.activeMatchCount > 0;
+    if (counting || contested) base = POLL_LIVE;
+  }
+  // Transient node trouble stretches the interval; see fetchLifecycle().
+  return Math.min(base * pollBackoff, POLL_MAX);
 }
 
 function schedulePoll() {

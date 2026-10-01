@@ -1,70 +1,54 @@
 // =============================================================
 // PRT / Dave consensus — status reads
 // =============================================================
-// The rollups node indexes the *structure* of a dispute (which tournaments
-// exist, who joined, which matches were created and how they ended). It does
-// not index *live* state: tournament standing, commitment clocks, match phase,
-// or whether a result can be staged/accepted. Those are read straight from the
-// contracts.
+// Since rollups-node PR #798 the node indexes both the *structure* of a
+// dispute (tournaments, commitments, matches and how they ended) and a
+// *snapshot* of live contract state read at a stated block: tournament
+// standing, match phase and bisection frontier, commitment clocks. The panel
+// is built from those snapshots.
 //
-//   node RPC  -> epochs, tournament tree, commitments, matches   (history)
-//   eth_call  -> standing, clocks, phase, canStage/canAccept     (live)
+//   node RPC  -> epochs, tournament tree, commitments, matches, snapshots
+//   eth_call  -> the staged-claim sentry state only (the one live fact the
+//                node does not index): canAcceptStagedTournamentResult plus
+//                the sentry claim counters
 //
-// CONTRACT GENERATIONS
-// Dave replaced its entire read surface between 3.0.0-alpha.3 and
-// 3.0.0-alpha.4 — the two share no observer functions at all. Node
-// v2.0.0-alpha.12 pins contracts 3.0.0-alpha.3 (see its Makefile,
-// ROLLUPS_PRT_CONTRACTS_VERSION); the release that carries the new emulator is
-// expected to move to 3.0.0-alpha.4. We target alpha.4 and keep a reduced
-// alpha.3 fallback so a deployment against either generation still shows
-// something. Generation is probed once and cached.
+// Snapshots are taken at the node's default block (FINALIZED on Base means a
+// few minutes behind). `asOfBlock` is exposed so the UI can say so.
 //
-// Value types, per the alpha.4 artifacts:
-//   Machine.Hash, Tree.Node          -> bytes32
-//   Time.Instant, Time.Duration      -> uint64   (block numbers / block counts)
-//   every enum                       -> uint8
+// Dave contracts: the node pins 3.0.0-alpha.5, whose IDaveConsensus read
+// surface is identical to alpha.4 for the function used here.
 // =============================================================
 
 import { parseAbi } from "viem";
 
 // -------------------------------------------------------------
-// ABIs — Dave v3.0.0-alpha.4
-// Verified against cartesi-rollups-prt-3.0.0-alpha.4-contract-artifacts.
+// ABI — IDaveConsensus, Dave v3.0.0-alpha.5
+// Verified against cartesi-rollups-prt-3.0.0-alpha.5-contract-artifacts.
 // -------------------------------------------------------------
-export const daveConsensusAbiV4 = parseAbi([
+export const daveConsensusAbi = parseAbi([
   "function getCurrentSealedEpoch() view returns (uint256 epochNumber, uint256 inputIndexLowerBound, uint256 inputIndexUpperBound, address tournament, bool isTournamentResultStaged, uint256 stagingBlockNumber, bytes32 stagedPostEpochMachineStateHash, bytes32 stagedPostEpochOutputsMerkleRoot)",
   "function canStageTournamentResult() view returns (bool isFinished, bool isTournamentFailed, bool isTournamentResultStaged, uint256 epochNumber, bytes32 winnerCommitment, bytes32 winnerPostEpochMachineStateHash)",
   "function canAcceptStagedTournamentResult() view returns (bool isTournamentResultStaged, bool doAllSentriesAgreeWithStagedTournamentResult, bool isClaimStagingPeriodOver, uint256 epochNumber, bytes32 stagedPostEpochMachineStateHash, bytes32 stagedPostEpochOutputsMerkleRoot)",
   "function getClaimStagingPeriod() view returns (uint256)",
+  "function getNumberOfSentries() view returns (uint256)",
+  "function getSentryClaimCount(uint256 epochNumber, bytes32 postEpochMachineStateHash) view returns (uint256)",
+  "function hasSentryClaimedInEpoch(uint256 epochNumber, uint256 sentryId) view returns (bool)",
 ]);
 
-export const tournamentAbiV4 = parseAbi([
-  "struct TournamentStandingView { uint8 standing; bool acceptsJoins; bool hasCandidate; bytes32 candidate; bytes32 finalState; bytes32 parentCommitment; uint64 finishedAt; uint64 winnerExpiresAt; }",
-  "struct CommitmentStandingView { bool joined; bytes32 finalState; address claimer; bool clockRunning; uint64 clockDeadline; uint64 clockAllowance; }",
-  "struct BisectingMatchView { bytes32 revealingParent; bytes32 waitingLeft; bytes32 waitingRight; uint256 segmentStartPosition; uint256 segmentStartCycle; uint64 currentHeight; uint8 responder; }",
-  "function tournamentStanding() view returns (TournamentStandingView)",
-  "function commitmentStanding(bytes32 commitmentRoot) view returns (CommitmentStandingView)",
-  "function bisectingMatch(bytes32 matchIdHash) view returns (uint8 actualPhase, BisectingMatchView value)",
-]);
-
-// -------------------------------------------------------------
-// ABIs — Dave v3.0.0-alpha.3 (reduced fallback)
-// Only the tournament reads needed to keep the panel meaningful; the alpha.3
-// consensus surface is not read at all.
-// -------------------------------------------------------------
-export const tournamentAbiV3 = parseAbi([
-  "function isFinished() view returns (bool)",
-  "function isClosed() view returns (bool)",
-  "function arbitrationResult() view returns (bool finished, bytes32 winnerCommitment, bytes32 finalState)",
-  "function tournamentLevelConstants() view returns (uint64 maxLevel, uint64 level, uint64 log2step, uint64 height)",
-]);
+// `doAllSentriesAgreeWithStagedTournamentResult` is the contract's FAST PATH:
+// true only when every sentry has claimed the staged hash, which lets the
+// result be accepted before the staging period ends. It is false with zero
+// sentries and while sentries have not claimed yet — it does NOT mean a sentry
+// disagrees. Dissent is derived from the claim counters instead: a sentry
+// that claimed in the epoch but not for the staged hash claimed another one.
 
 // -------------------------------------------------------------
 // Enum / status maps
 //
-// `tone` must name a real .status-<tone> rule in arena.css.
+// Keys are the node's enum members (rpc.discover, pinned in
+// test/fixtures/jsonrpc-discover.json). `tone` must name a real
+// .status-<tone> rule in arena.css.
 // -------------------------------------------------------------
-// Node EpochStatus (jsonrpc-discover.json @ node v2.0.0-alpha.12).
 export const EPOCH_STATUS = {
   OPEN: { label: "OPEN", tone: "open" },
   CLOSED: { label: "CLOSED", tone: "pending" },
@@ -77,11 +61,28 @@ export const EPOCH_STATUS = {
   CLAIM_FORECLOSED: { label: "FORECLOSED", tone: "bad" },
 };
 
-// An unknown status must stay legible rather than render as raw unstyled text,
-// which is what the previous substring-matching implementation did for CLOSED
-// and INPUTS_PROCESSED.
+// Terminal statuses never regress (node docs), so a settled epoch needs no
+// live tracking.
+export const TERMINAL_EPOCH_STATUS = [
+  "CLAIM_ACCEPTED",
+  "CLAIM_REJECTED",
+  "CLAIM_FORECLOSED",
+];
+
+// The epoch consensus is actually working on is the *oldest* one that has
+// left OPEN and not yet settled. Under PRT this is where the tournament lives;
+// the newest epoch is merely collecting inputs.
+export const NON_TERMINAL_PAST_OPEN = [
+  "CLOSED",
+  "INPUTS_PROCESSED",
+  "CLAIM_COMPUTED",
+  "CLAIM_SUBMITTED",
+  "CLAIM_STAGED",
+];
+
+// An unknown status must stay legible rather than render as raw unstyled text.
 export function epochStatus(epoch) {
-  const raw = (epoch?.status ?? epoch?.state ?? "").toString();
+  const raw = (epoch?.status ?? "").toString();
   return (
     EPOCH_STATUS[raw.toUpperCase()] ?? {
       label: raw ? raw.replace(/_/g, " ").toUpperCase() : "—",
@@ -90,16 +91,27 @@ export function epochStatus(epoch) {
   );
 }
 
-// ITournament.TournamentStanding — index order is the on-chain enum order.
-export const TOURNAMENT_STANDING = [
-  { key: "MATCHES_ACTIVE", label: "DISPUTE ACTIVE", tone: "bad" },
-  { key: "AWAITING_CLOSURE", label: "AWAITING CLOSURE", tone: "pending" },
-  { key: "ROOT_WINNER", label: "SETTLED", tone: "ok" },
-  { key: "ROOT_FAILED", label: "FAILED — NO WINNER", tone: "bad" },
-  { key: "INNER_WINNER", label: "INNER WINNER", tone: "ok" },
-  { key: "INNER_ELIMINABLE_NO_WINNER", label: "ELIMINABLE", tone: "bad" },
-  { key: "INNER_ELIMINABLE_WINNER_EXPIRED", label: "ELIMINABLE", tone: "bad" },
-];
+export const isSettled = (epoch) =>
+  TERMINAL_EPOCH_STATUS.includes(String(epoch?.status ?? "").toUpperCase());
+
+// TournamentStandingState
+export const TOURNAMENT_STANDING = {
+  MATCHES_ACTIVE: { label: "DISPUTE ACTIVE", tone: "bad" },
+  AWAITING_CLOSURE: { label: "AWAITING CLOSURE", tone: "pending" },
+  ROOT_WINNER: { label: "SETTLED", tone: "ok" },
+  ROOT_FAILED: { label: "FAILED — NO WINNER", tone: "bad" },
+  INNER_WINNER: { label: "INNER WINNER", tone: "ok" },
+  INNER_ELIMINABLE_NO_WINNER: { label: "ELIMINABLE", tone: "bad" },
+  INNER_ELIMINABLE_WINNER_EXPIRED: { label: "ELIMINABLE", tone: "bad" },
+};
+
+export const standingOf = (key) => {
+  const k = String(key ?? "").toUpperCase();
+  const s = TOURNAMENT_STANDING[k];
+  return s
+    ? { key: k, ...s }
+    : { key: k ? `UNKNOWN_${k}` : "UNKNOWN", label: "UNKNOWN", tone: "pending" };
+};
 
 export const MATCH_PHASE = [
   "UNINITIALIZED",
@@ -110,21 +122,23 @@ export const MATCH_PHASE = [
 
 export const COMMITMENT_SIDE = ["ONE", "TWO"];
 
-// Node MatchDeletionReason. NOT_DELETED is the node's own marker for a match
-// that is still live; it is not an on-chain enum member.
+// MatchTimeoutOutcome — what the timeout classifier says would happen if the
+// clock ran out now. NONE means nobody is out of time.
+export const TIMEOUT_OUTCOME = {
+  NONE: null,
+  ONE_WINS: "ONE can win by timeout",
+  TWO_WINS: "TWO can win by timeout",
+  ELIMINATE_BOTH: "both eliminable",
+};
+
+// MatchDeletionReason. NOT_DELETED is the node's own marker for a match that
+// is still live; it is not an on-chain enum member.
 export const DELETION_REASON = {
   NOT_DELETED: "active",
   STEP: "proven wrong by step",
   TIMEOUT: "timed out",
   CHILD_TOURNAMENT: "decided by inner tournament",
 };
-
-export const standingOf = (i) =>
-  TOURNAMENT_STANDING[Number(i)] ?? {
-    key: `UNKNOWN_${i}`,
-    label: "UNKNOWN",
-    tone: "pending",
-  };
 
 export const isMatchActive = (m) =>
   !m?.deletionReason || m.deletionReason === "NOT_DELETED";
@@ -133,106 +147,15 @@ export const isMatchActive = (m) =>
 // helpers
 // -------------------------------------------------------------
 
-// Mirrors the safe() idiom already used in main.js: a failed read yields null
-// for that one field instead of taking down the whole panel. This is what makes
-// an ABI-generation mismatch degrade to node-only data.
+// A failed read yields null for that one field instead of taking down the
+// whole panel.
 const safe = (p) => Promise.resolve(p).then((v) => v, () => null);
 
-const totalCount = (r) =>
-  Number(r?.pagination?.total_count ?? r?.pagination?.totalCount ?? 0);
-
 const rows = (r) => (Array.isArray(r) ? r : (r?.data ?? []));
+const totalCount = (r) => Number(r?.pagination?.totalCount ?? rows(r).length);
 
-// Generation is a property of the deployment, so resolve once and remember.
-//
-// It is resolved against a *tournament*, not the consensus contract: the
-// obvious-looking probe (does IDaveConsensus have getClaimStagingPeriod?) gives
-// a false positive, because the plain IConsensus that authority deployments use
-// also answers it. ITournament's two generations, by contrast, share no read
-// functions at all, so tournamentStanding() is an unambiguous discriminator.
-const GENERATION_CACHE = new Map();
-
-/**
- * Read a tournament's standing, trying alpha.4 first and alpha.3 second.
- * Returns null when neither generation answers (no chain, wrong address, or a
- * third generation we do not know about).
- */
-export async function readTournamentStanding(l1Client, address) {
-  if (!l1Client || !address) return null;
-
-  const v4 = await safe(
-    l1Client.readContract({
-      address,
-      abi: tournamentAbiV4,
-      functionName: "tournamentStanding",
-    }),
-  );
-  if (v4) {
-    return {
-      generation: "v4",
-      standing: standingOf(v4.standing),
-      acceptsJoins: v4.acceptsJoins,
-      hasCandidate: v4.hasCandidate,
-      candidate: v4.candidate,
-      finishedAt: v4.finishedAt,
-      winnerExpiresAt: v4.winnerExpiresAt,
-    };
-  }
-
-  // alpha.3 has no standing enum; synthesise one from isFinished +
-  // arbitrationResult. A finished tournament with a zero winner commitment is
-  // the alpha.3 spelling of ROOT_FAILED.
-  const [finished, closed, arb] = await Promise.all([
-    safe(
-      l1Client.readContract({
-        address,
-        abi: tournamentAbiV3,
-        functionName: "isFinished",
-      }),
-    ),
-    safe(
-      l1Client.readContract({
-        address,
-        abi: tournamentAbiV3,
-        functionName: "isClosed",
-      }),
-    ),
-    safe(
-      l1Client.readContract({
-        address,
-        abi: tournamentAbiV3,
-        functionName: "arbitrationResult",
-      }),
-    ),
-  ]);
-  if (finished == null) return null;
-
-  const hasWinner =
-    Array.isArray(arb) && arb[0] === true && !/^0x0*$/.test(arb[1] ?? "0x0");
-  return {
-    generation: "v3",
-    standing: finished ? (hasWinner ? standingOf(2) : standingOf(3)) : standingOf(0),
-    acceptsJoins: closed === false,
-    hasCandidate: hasWinner,
-    candidate: Array.isArray(arb) ? arb[1] : null,
-    finishedAt: null,
-    winnerExpiresAt: null,
-  };
-}
-
-export async function detectGeneration(l1Client, tournamentAddress) {
-  if (!l1Client || !tournamentAddress) return null;
-  const key = tournamentAddress.toLowerCase();
-  if (GENERATION_CACHE.has(key)) return GENERATION_CACHE.get(key);
-  const res = await readTournamentStanding(l1Client, tournamentAddress);
-  const gen = res?.generation ?? null;
-  if (gen) GENERATION_CACHE.set(key, gen);
-  return gen;
-}
-
-export function _resetGenerationCache() {
-  GENERATION_CACHE.clear();
-}
+const maxBig = (values) =>
+  values.reduce((m, v) => (v != null && (m == null || v > m) ? v : m), null);
 
 // -------------------------------------------------------------
 // tree
@@ -274,56 +197,53 @@ export function buildTournamentTree(tournaments) {
 // -------------------------------------------------------------
 
 /**
- * Collect PRT status for one epoch.
- *
- * Collapsed: ~4 node calls + ~3 eth_calls.
- * Expanded adds one standing read per tournament and, per active match, a phase
- * read plus two clock reads — all batched into few HTTP round trips.
+ * Collect PRT status for one epoch: three node list calls, one eth_call for a
+ * staged claim, and one eth_blockNumber when an L1 client is available.
  *
  * Never throws: every read is individually guarded.
  */
 export async function fetchPrtState({
-  cartesiClient,
+  nodeClient,
   l1Client,
   application,
   consensusAddress,
   epoch,
   claimStagingPeriod,
-  expanded = false,
 }) {
   const out = {
-    generation: null,
+    epochIndex: epoch?.index ?? null,
     consensusAddress: consensusAddress ?? null,
     tournaments: [],
     order: [],
     root: null,
     matches: [],
+    commitments: [],
     commitmentCount: 0,
     matchCount: 0,
     activeMatchCount: 0,
     disputed: false,
     staging: null,
     currentBlock: null,
-    chainOk: false,
+    asOfBlock: null, // block the node's snapshots were read at
+    snapshotOk: null, // false when tournaments exist without snapshots
   };
-  if (!epoch) return out;
+  if (!epoch || !nodeClient) return out;
 
   const epochIndex = epoch.index;
 
-  // Commitments are counted, not listed — pagination.total_count is enough and
-  // costs no row transfer. Tournaments and matches are capped at 50: the counts
-  // stay exact (they come from total_count too), only the rendered detail
-  // truncates, which no realistic dispute on a test app will reach.
+  // Counts come from pagination.totalCount and stay exact; only the rendered
+  // detail truncates at 50, which no realistic dispute on this app reaches.
   const [tournamentsR, commitmentsR, matchesR] = await Promise.all([
-    safe(cartesiClient.listTournaments({ application, epochIndex, limit: 50 })),
-    safe(cartesiClient.listCommitments({ application, epochIndex, limit: 1 })),
-    safe(cartesiClient.listMatches({ application, epochIndex, limit: 50 })),
+    safe(nodeClient.listTournaments({ application, epochIndex, limit: 50 })),
+    safe(nodeClient.listCommitments({ application, epochIndex, limit: 50 })),
+    safe(nodeClient.listMatches({ application, epochIndex, limit: 50 })),
   ]);
 
   out.tournaments = rows(tournamentsR);
+  out.commitments = rows(commitmentsR);
   out.commitmentCount = totalCount(commitmentsR);
-  out.matches = rows(matchesR);
-  out.matchCount = totalCount(matchesR) || out.matches.length;
+  out.matches = rows(matchesR).map((m) => ({ ...m }));
+  out.matchCount = totalCount(matchesR);
   out.activeMatchCount = out.matches.filter(isMatchActive).length;
 
   // More than one commitment means validators disagreed on the post-epoch
@@ -332,77 +252,118 @@ export async function fetchPrtState({
 
   const { roots, order } = buildTournamentTree(out.tournaments);
   out.order = order;
+  for (const { node } of order) {
+    const s = node.snapshot;
+    node.standing = s ? standingOf(s.standing) : null;
+    node.acceptsJoins = s?.acceptsJoins ?? null;
+    node.candidate = s?.candidate ?? null;
+    node.winnerCommitment = s?.winnerCommitment ?? null;
+    node.finishedAtBlock = s?.finishedAtBlock ?? null;
+  }
   out.root =
     roots.find((r) => Number(r.level) === 0) ??
     roots[0] ??
     (epoch.tournamentAddress
-      ? { address: epoch.tournamentAddress, level: 0n, children: [] }
+      ? { address: epoch.tournamentAddress, level: 0n, children: [], standing: null }
       : null);
 
-  if (!l1Client) return out;
+  if (out.tournaments.length)
+    out.snapshotOk = out.tournaments.every((t) => t.snapshot != null);
 
-  const blockNumber = await safe(l1Client.getBlockNumber());
-  out.currentBlock = blockNumber;
+  out.asOfBlock = maxBig([
+    ...out.tournaments.map((t) => t.snapshot?.asOfBlock),
+    ...out.matches.map((m) => m.snapshot?.asOfBlock),
+    ...out.commitments.map((c) => c.snapshot?.asOfBlock),
+  ]);
 
-  // Root standing — the single most informative live fact. This also settles
-  // which contract generation we are talking to.
-  if (out.root?.address) {
-    const res = await readTournamentStanding(l1Client, out.root.address);
-    if (res) {
-      out.chainOk = true;
-      out.generation = res.generation;
-      GENERATION_CACHE.set(out.root.address.toLowerCase(), res.generation);
-      out.root.standing = res.standing;
-      out.root.acceptsJoins = res.acceptsJoins;
-      out.root.hasCandidate = res.hasCandidate;
-      out.root.candidate = res.candidate;
-      out.root.finishedAt = res.finishedAt;
+  // Freshest block we can get: the chain if it answers, else the node's view.
+  const chainBlock = l1Client ? await safe(l1Client.getBlockNumber()) : null;
+  out.currentBlock = chainBlock ?? out.asOfBlock;
+
+  // ---- matches: phase + clocks from snapshots ----
+  const clockByKey = new Map();
+  for (const c of out.commitments) {
+    if (!c.snapshot) continue;
+    clockByKey.set(
+      `${(c.tournamentAddress || "").toLowerCase()}:${(c.commitment || "").toLowerCase()}`,
+      {
+        running: c.snapshot.clockRunning ?? null,
+        deadline: c.snapshot.clockDeadline ?? null,
+        allowance: c.snapshot.clockAllowance ?? null,
+        claimer: c.snapshot.claimer ?? null,
+      },
+    );
+  }
+  for (const m of out.matches) {
+    const s = m.snapshot;
+    m.phase = s?.phase ?? null;
+    m.currentHeight = s?.bisection?.currentHeight ?? null;
+    m.responder = s?.bisection?.responder ?? null;
+    m.timeoutOutcome = s?.timeoutOutcome ?? null;
+    const t = (m.tournamentAddress || "").toLowerCase();
+    m.clocks = [m.commitmentOne, m.commitmentTwo].map(
+      (c) => clockByKey.get(`${t}:${(c || "").toLowerCase()}`) ?? null,
+    );
+    m.blocksToTimeout = null;
+    if (!isMatchActive(m)) continue;
+    const onClock = m.responder === "TWO" ? m.clocks[1] : m.clocks[0];
+    if (onClock?.running && onClock.deadline != null && out.currentBlock != null) {
+      const left = BigInt(onClock.deadline) - BigInt(out.currentBlock);
+      m.blocksToTimeout = left > 0n ? left : 0n;
     }
   }
 
-  // Staging is an alpha.4 concept; alpha.3 settles in a single step. Only
-  // report it when the chain actually answered, so a revert leaves the row
-  // hidden rather than showing an empty countdown.
-  if (
-    out.generation === "v4" &&
-    consensusAddress &&
-    epochStatus(epoch).label === "STAGED"
-  ) {
-    const can = await safe(
-      l1Client.readContract({
-        address: consensusAddress,
-        abi: daveConsensusAbiV4,
-        functionName: "canAcceptStagedTournamentResult",
-      }),
-    );
-    const period =
-      claimStagingPeriod ??
-      (await safe(
-        l1Client.readContract({
-          address: consensusAddress,
-          abi: daveConsensusAbiV4,
-          functionName: "getClaimStagingPeriod",
-        }),
-      ));
+  // ---- staging ----
+  if (epochStatus(epoch).label === "STAGED") {
+    const read = (functionName, args = []) =>
+      l1Client && consensusAddress
+        ? safe(
+            l1Client.readContract({
+              address: consensusAddress,
+              abi: daveConsensusAbi,
+              functionName,
+              args,
+            }),
+          )
+        : Promise.resolve(null);
 
-    // stagedAtBlock comes from the node, but older @cartesi/viem builds drop
-    // the field. getCurrentSealedEpoch() carries the same block on-chain, so
-    // fall back to it rather than losing the countdown.
-    let stagedAt = epoch.stagedAtBlock;
-    if (stagedAt == null) {
-      const sealed = await safe(
-        l1Client.readContract({
-          address: consensusAddress,
-          abi: daveConsensusAbiV4,
-          functionName: "getCurrentSealedEpoch",
-        }),
-      );
-      if (sealed && sealed[4]) stagedAt = sealed[5]; // isTournamentResultStaged -> stagingBlockNumber
+    const [can, sentryCount] = await Promise.all([
+      read("canAcceptStagedTournamentResult"),
+      read("getNumberOfSentries"),
+    ]);
+
+    // Sentry claims: `agreeing` claimed the staged hash, `claimed` claimed
+    // anything this epoch. claimed > agreeing means someone claimed a
+    // different hash — that is a dissent.
+    let sentries = null;
+    if (can && can[0] && sentryCount != null && sentryCount > 0n) {
+      const total = Number(sentryCount);
+      const epochNumber = can[3];
+      const [agreeing, ...claimedFlags] = await Promise.all([
+        read("getSentryClaimCount", [epochNumber, can[4]]),
+        ...Array.from({ length: total }, (_, i) =>
+          read("hasSentryClaimedInEpoch", [epochNumber, BigInt(i + 1)]),
+        ),
+      ]);
+      const claimed = claimedFlags.filter((f) => f === true).length;
+      sentries = {
+        total,
+        agreeing: agreeing == null ? null : Number(agreeing),
+        claimed,
+        dissent: agreeing != null && claimed > Number(agreeing),
+      };
     }
 
     let blocksLeft = null;
-    if (stagedAt != null && period != null && blockNumber != null) {
-      const left = BigInt(stagedAt) + BigInt(period) - BigInt(blockNumber);
+    if (
+      epoch.stagedAtBlock != null &&
+      claimStagingPeriod != null &&
+      out.currentBlock != null
+    ) {
+      const left =
+        BigInt(epoch.stagedAtBlock) +
+        BigInt(claimStagingPeriod) -
+        BigInt(out.currentBlock);
       blocksLeft = left > 0n ? left : 0n;
     }
 
@@ -410,91 +371,14 @@ export async function fetchPrtState({
     if (can != null || blocksLeft != null) {
       out.staging = {
         staged: can ? can[0] : true,
+        // fast path: every sentry already claimed the staged hash
         sentriesAgree: can ? can[1] : null,
         isOver: can ? can[2] : blocksLeft === 0n,
-        periodBlocks: period ?? null,
+        periodBlocks: claimStagingPeriod ?? null,
         blocksLeft,
+        sentries,
       };
     }
-  }
-
-  if (!expanded) return out;
-
-  // ---- expanded detail ----
-  // The alpha.3 surface has no per-match phase or clock projection, so the
-  // expanded view is alpha.4 only; alpha.3 still shows the tree and the
-  // node-indexed match outcomes.
-  if (out.generation === "v4") {
-    await Promise.all(
-      out.order.map(async ({ node }) => {
-        if (node === out.root || !node.address) return;
-        const s = await safe(
-          l1Client.readContract({
-            address: node.address,
-            abi: tournamentAbiV4,
-            functionName: "tournamentStanding",
-          }),
-        );
-        if (s) {
-          node.standing = standingOf(s.standing);
-          node.acceptsJoins = s.acceptsJoins;
-        }
-      }),
-    );
-
-    await Promise.all(
-      out.matches.filter(isMatchActive).map(async (m) => {
-        // bisectingMatch returns the match's *actual* phase whatever the
-        // variant, so one call gives phase and bisection payload together.
-        const res = await safe(
-          l1Client.readContract({
-            address: m.tournamentAddress,
-            abi: tournamentAbiV4,
-            functionName: "bisectingMatch",
-            args: [m.idHash],
-          }),
-        );
-        if (res) {
-          m.phase = MATCH_PHASE[Number(res[0])] ?? "UNKNOWN";
-          m.currentHeight = res[1]?.currentHeight ?? null;
-          m.responder = COMMITMENT_SIDE[Number(res[1]?.responder ?? 0)];
-        }
-        const [c1, c2] = await Promise.all([
-          safe(
-            l1Client.readContract({
-              address: m.tournamentAddress,
-              abi: tournamentAbiV4,
-              functionName: "commitmentStanding",
-              args: [m.commitmentOne],
-            }),
-          ),
-          safe(
-            l1Client.readContract({
-              address: m.tournamentAddress,
-              abi: tournamentAbiV4,
-              functionName: "commitmentStanding",
-              args: [m.commitmentTwo],
-            }),
-          ),
-        ]);
-        m.clocks = [c1, c2].map((c) =>
-          c
-            ? {
-                running: c.clockRunning,
-                deadline: c.clockDeadline,
-                allowance: c.clockAllowance,
-                claimer: c.claimer,
-              }
-            : null,
-        );
-        // Blocks until the side on the clock times out.
-        const onClock = m.responder === "TWO" ? m.clocks[1] : m.clocks[0];
-        if (onClock?.running && blockNumber != null && onClock.deadline != null) {
-          const left = BigInt(onClock.deadline) - BigInt(blockNumber);
-          m.blocksToTimeout = left > 0n ? left : 0n;
-        }
-      }),
-    );
   }
 
   return out;
@@ -523,16 +407,31 @@ export function formatBlocks(n, secondsPerBlock = 2) {
         : `~${Math.round(secs / 3600)}h`;
   // non-breaking spaces: the quantity is one unit and should not be split
   // across a wrapped line ("35" / "blk (~1m)")
-  return `${b}\u00a0blk\u00a0(${t})`;
+  return `${b} blk (${t})`;
 }
 
 /** One line describing the staged-claim countdown, or null when not staged. */
 export function describeStaging(prt, secondsPerBlock = 2) {
   const s = prt?.staging;
   if (!s) return null;
-  // A dissenting sentry blocks acceptance outright — that outranks the clock.
-  if (s.sentriesAgree === false)
-    return { text: "a sentry disagrees with the result", tone: "bad" };
+  const n = s.sentries;
+  // A sentry that claimed another hash is the one fact worth shouting; the
+  // staging period must then run its course.
+  if (n?.dissent) {
+    const when = s.isOver
+      ? "staging period over — awaiting acceptance"
+      : `accepts in ${formatBlocks(s.blocksLeft, secondsPerBlock)}`;
+    return {
+      text: `a sentry disagrees (${n.agreeing}/${n.claimed} claimed the staged result) · ${when}`,
+      tone: "bad",
+    };
+  }
+  // Fast path: every sentry claimed the staged hash, no need to wait.
+  if (s.sentriesAgree === true)
+    return {
+      text: `all ${n?.total ?? ""} sentries agree — acceptable now`.replace("  ", " "),
+      tone: "ok",
+    };
   if (s.isOver)
     return { text: "staging period over — awaiting acceptance", tone: "dim" };
   return {
@@ -544,10 +443,12 @@ export function describeStaging(prt, secondsPerBlock = 2) {
 /** Summary line for the collapsed dispute row. */
 export function describeDispute(prt) {
   if (!prt?.disputed) return null;
-  const bits = [
+  const bits = [];
+  if (prt.epochIndex != null) bits.push(`epoch #${prt.epochIndex}`);
+  bits.push(
     `${prt.commitmentCount} commitments`,
     `${prt.activeMatchCount}/${prt.matchCount} matches active`,
-  ];
+  );
   if (prt.tournaments.length > 1)
     bits.push(`${prt.tournaments.length} tournaments`);
   return {
@@ -558,7 +459,7 @@ export function describeDispute(prt) {
 
 /**
  * Flatten the tournament tree into renderable rows, interleaving each
- * tournament with the matches that belong to it.
+ * tournament with the matches that belong to it, then any caveats.
  */
 export function describeTree(prt, secondsPerBlock = 2) {
   if (!prt) return [];
@@ -589,6 +490,7 @@ export function describeTree(prt, secondsPerBlock = 2) {
             m.blocksToTimeout != null
               ? `${m.responder ?? "?"} on clock · ${formatBlocks(m.blocksToTimeout, secondsPerBlock)}`
               : null,
+            TIMEOUT_OUTCOME[m.timeoutOutcome] ?? null,
           ]
             .filter(Boolean)
             .join(" · ")
@@ -601,6 +503,23 @@ export function describeTree(prt, secondsPerBlock = 2) {
         active,
       });
     }
+  }
+
+  if (prt.snapshotOk === false)
+    out.push({
+      kind: "note",
+      label: "live dispute state unavailable from this node",
+    });
+  if (
+    prt.asOfBlock != null &&
+    prt.currentBlock != null &&
+    BigInt(prt.currentBlock) > BigInt(prt.asOfBlock)
+  ) {
+    const lag = BigInt(prt.currentBlock) - BigInt(prt.asOfBlock);
+    out.push({
+      kind: "note",
+      label: `node view as of block ${prt.asOfBlock} · ${formatBlocks(lag, secondsPerBlock)} behind`,
+    });
   }
   return out;
 }

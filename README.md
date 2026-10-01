@@ -43,6 +43,41 @@ npx -p @cartesi/cli@2.0.0-alpha.18 cartesi build
 npx -p @cartesi/cli@2.0.0-alpha.18 cartesi run --block-time 1 --epoch-length 10 --project-name app --port 8080
 ```
 
+### Run a PRT devnet with the rollups-node binaries (next/2.0)
+
+The frontend targets rollups-node `next/2.0` (PR #798 shapes). To run it against a local PRT deployment with the native `cartesi-rollups-*` binaries (no containers), you need `anvil`/`cast` (Foundry) and a PostgreSQL:
+
+```shell
+# 1. L1: the Dave release ships an anvil state with every contract deployed
+VER=3.0.0-alpha.5
+curl -sSL https://github.com/cartesi/dave/releases/download/v${VER}/cartesi-rollups-prt-${VER}-anvil-1.5.1.tar.gz | tar xz -C /tmp
+anvil --port 18545 --chain-id 31337 --block-time 1 --mixed-mining --load-state /tmp/state.json &
+cat /tmp/deployments/31337/*.json | jq -s 'map({ (.contractName): .address }) | add'   # addresses below come from here
+
+# 2. node database
+export CARTESI_DATABASE_CONNECTION="postgres://postgres@127.0.0.1:5432/rollupsdb?sslmode=disable"
+cartesi-rollups-cli db init
+
+# 3. deploy the machine as a PRT application
+export CARTESI_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:18545 CARTESI_BLOCKCHAIN_ID=31337
+export CARTESI_CONTRACTS_INPUT_BOX_ADDRESS=0xEbE9f4Dfc04ae10bBeE663859c3dc5A23f94eA3C
+export CARTESI_CONTRACTS_APPLICATION_FACTORY_ADDRESS=0x35Cd91f13141Bb6A6FC69E1eeDD241bbA1Ddd45F
+export CARTESI_CONTRACTS_SELF_HOSTED_APPLICATION_FACTORY_ADDRESS=0x9e6866A965dC5f99f95EF6B0d8399dad18eEf98b
+export CARTESI_CONTRACTS_AUTHORITY_FACTORY_ADDRESS=0xB4d29c86e36385b5321a453C34D288AEB0ad11f9
+export CARTESI_CONTRACTS_QUORUM_FACTORY_ADDRESS=0x0754D5Eb680c71bf469B39e48C5b64AB0813fdb9
+export CARTESI_CONTRACTS_DAVE_APP_FACTORY_ADDRESS=0xd34BEC37Fa5816ABA2f87BdaD2E13dd1B161370f
+export CARTESI_AUTH_MNEMONIC="test test test test test test test test test test test junk"
+export CARTESI_PRT_AUTH_MNEMONIC="$CARTESI_AUTH_MNEMONIC" CARTESI_PRT_AUTH_MNEMONIC_ACCOUNT_INDEX=6
+cartesi-rollups-cli deploy application doom_arena .cartesi/image --prt --epoch-length 10 --claim-staging-period 30 --json
+
+# 4. node — the CORS origin must be the site's exact origin
+CARTESI_JSONRPC_CORS_ALLOWED_ORIGINS=http://localhost:3000 CARTESI_EVM_READER_POLLING_INTERVAL=1 cartesi-rollups-node -d latest
+```
+
+Then point `doom-arena-website/src/config.js` at `NODE_URL = "http://localhost:10011"`, `L1_RPC_URL = "http://127.0.0.1:18545"`, the application address printed by the deploy and the InputBox above, and run `npm run smoke -- http://localhost:10011 doom_arena 31337` before opening the site.
+
+The gameplay fixtures in `tests/model.py` are tied to sender `0xdeadbeef7dc51b33c9a3e4a21ae053daa1872810`; on anvil you can submit them from that address with `cast rpc anvil_impersonateAccount <addr>`, `cast rpc anvil_setBalance <addr> 0x8AC7230489E80000` and `cast send --unlocked --from <addr> ...`.
+
 ### Running in Dev Mode
 
 You'll be able to update the binaries and the snapshot will be updated. To generate the binaries run:
@@ -105,31 +140,53 @@ cartesapp deploy --log-level debug \
 
 ### Using the Web Frontend
 
-You can use the web interface in the `website/` directory to play and submit gameplays directly from your browser.
+You can use the web interface in the `doom-arena-website/` directory to play and submit gameplays directly from your browser.
 
-First, configure the constants in [website/src/consts.ts](website/src/consts.ts):
+The site targets **rollups-node `next/2.0`** (with the PR #798 JSON-RPC shapes: tournament/match/commitment `snapshot`s, no `data_availability`). It checks `cartesi_getNodeInfo` at startup and shows an "unsupported node" note against older nodes instead of half-working.
 
-```typescript
+First, configure the constants in [doom-arena-website/src/config.js](doom-arena-website/src/config.js):
+
+```javascript
 // Network configuration
 export const CHAIN_ID = "0x7a69"; // Local devnet chain ID (31337 in hex)
 
 // Application contract address (from your node startup)
 export const APPLICATION_ADDRESS = "0x6c060d453705bc56797d84516feb949c9bd53caa";
 
-// Cartesi node URL
-export const NODE_URL = "http://localhost:8080";
+// Cartesi node URL (JSON-RPC at `${NODE_URL}/rpc`)
+export const NODE_URL = "http://localhost:10011";
+
+// InputBox address — cross-checked against what the node reports
+export const INPUT_BOX_ADDRESS = "0x...";
+```
+
+`CHAIN_ID`, `APPLICATION_ADDRESS` and `INPUT_BOX_ADDRESS` are cross-checked against `cartesi_getNodeInfo` / `cartesi_getApplication`; on a mismatch the Rollup-state panel says so and submissions are disabled (a run sent to an InputBox the node does not watch is lost silently).
+
+The node's JSON-RPC has **CORS disabled by default**, so the browser gets no answer unless the node allows the site's exact origin:
+
+```shell
+CARTESI_JSONRPC_CORS_ALLOWED_ORIGINS=http://localhost:3000 cartesi-rollups-node
 ```
 
 Then build and serve the website:
 
 ```shell
-cd website
+cd doom-arena-website
 npm install
 npm run build
 npm run dev
 ```
 
 Access the frontend at `http://localhost:3000`.
+
+Checks that do not need a browser:
+
+```shell
+npm test                                   # unit tests against the pinned rpc.discover fixture
+npm run check:discover -- http://localhost:10011   # diff a live node's rpc.discover against the fixture
+npm run smoke -- http://localhost:10011 doom_arena 31337   # live smoke against a running node
+npm run smoke:browser                      # headless Chrome against a fake node (needs a Chrome binary)
+```
 
 ### Using Rivemu
 
@@ -178,13 +235,18 @@ Note: if you are using the cartesi cli, you should add the `--rpc-url` pointing 
 
 You can get the outputs with the commands defined next. We'll assume you are using the local devnet initiated on one of the previous steps (set the application address and blockchain configuration with the correct values). You'll need `curl`, `jq`, `xxd` tools.
 
+The leaderboard notices are the outputs whose selector is `Notice(bytes)`; the node filters them server-side with `output_type`, and `descending` returns the newest first (the default is oldest first):
+
 ```shell
-RPC_URL=http://localhost:8080/rpc
+RPC_URL=http://localhost:10011/rpc
 curl -s ${RPC_URL} -d '{
   "jsonrpc": "2.0",
   "method": "cartesi_listOutputs",
   "params": {
-    "application": "app"
+    "application": "app",
+    "output_type": ["0xc258d6e5"],
+    "descending": true,
+    "limit": 100
   },
   "id": 1
 }' | jq -r '.result.data[].decoded_data.payload'
@@ -193,7 +255,7 @@ curl -s ${RPC_URL} -d '{
 You can also get the reports which will contain the errors:
 
 ```shell
-RPC_URL=http://localhost:6751/rpc
+RPC_URL=http://localhost:10011/rpc
 curl -s ${RPC_URL} -d '{
   "jsonrpc": "2.0",
   "method": "cartesi_listReports",
@@ -203,6 +265,14 @@ curl -s ${RPC_URL} -d '{
   "id": 1
 }' | jq -r '.result.data[].raw_data' | xxd -p -r
 ```
+
+And the node's own identity (chain id, version, and the block tag it reads the chain at):
+
+```shell
+curl -s ${RPC_URL} -d '{"jsonrpc":"2.0","method":"cartesi_getNodeInfo","params":[],"id":1}' | jq .result.data
+```
+
+Error codes on this node generation: `-31001` resource not found (e.g. no accepted epoch yet — safe to poll), `-31002` application not found (a configuration error), `-31003` response over the 10 MB budget, `-32070` timeout; `-32601`/`-32602`/`-32603` follow JSON-RPC 2.0.
 
 ## Run the Tests
 

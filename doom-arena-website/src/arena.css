@@ -771,6 +771,9 @@ h4 {
 .status-open {
     color: var(--accent);
 }
+.status-warn {
+    color: var(--warn);
+}
 /* statusOf() has always been able to emit "accepted"; the rule was missing, so
    an accepted epoch rendered in the default colour. */
 .status-accepted {
@@ -789,7 +792,9 @@ h4 {
 }
 
 .lc-staging,
-.lc-dispute {
+.lc-dispute,
+.lc-settling,
+.lc-note {
     display: flex;
     flex-direction: column;
     gap: 4px;
@@ -797,6 +802,23 @@ h4 {
     border-top: 1px solid var(--line, rgba(255, 255, 255, 0.08));
     font-family: var(--font-mono);
     font-size: 11px;
+}
+
+/* "settling epoch #N · STATUS" — the epoch consensus is working on, when it is
+   not the newest one shown above it. */
+.lc-settling {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+/* Operator-facing line: unsupported node, config mismatch, node trouble. Long
+   addresses wrap rather than widen the panel. */
+.lc-note {
+    font-size: 10px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
 }
 
 .lc-dispute-head {
