@@ -144,6 +144,12 @@
               </div>
             </div>
 
+            <!-- Hidden while the newest epoch is also the one being settled -->
+            <div class="lc-settling" id="lc-settling" hidden>
+              <span class="mono dim" id="lc-settling-idx">settling epoch #—</span>
+              <span class="status status-pending" id="lc-settling-status">—</span>
+            </div>
+
             <!-- PRT only; hidden unless the claim is staged -->
             <div class="lc-staging" id="lc-staging" hidden>
               <span class="mono dim" id="lc-staging-text">—</span>
@@ -161,6 +167,9 @@
             </div>
 
             <div class="lc-tree" id="lc-tree" hidden></div>
+
+            <!-- Operator-facing: unsupported node, config mismatch, node trouble -->
+            <div class="lc-note mono" id="lc-note" hidden></div>
           </div>
 
           <div class="panel-foot">
