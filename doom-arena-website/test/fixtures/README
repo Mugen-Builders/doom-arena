@@ -1,0 +1,3 @@
+jsonrpc-discover.json is rollups-node internal/jsonrpc/jsonrpc-discover.json at commit
+e99e85a95e74ac1fb59b7173d1684cb414fc1a1d (PR #798, feature/contracts-bump).
+Refresh it with: npm run check:discover -- <nodeUrl> --update
