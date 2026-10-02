@@ -286,6 +286,64 @@ h4 {
 .title-block .eyebrow {
     margin-bottom: 10px;
 }
+/* cartridge id: click to copy the application address */
+.copy-chip {
+    position: relative;
+    background: none;
+    border: 0;
+    border-bottom: 1px dashed var(--rule);
+    padding: 0 2px;
+    margin: 0;
+    color: inherit;
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    cursor: pointer;
+    transition:
+        color 0.12s,
+        border-color 0.12s,
+        transform 0.08s;
+}
+.copy-chip:hover {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+}
+.copy-chip:active {
+    transform: scale(0.97);
+}
+.copy-chip:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 2px;
+}
+.copy-chip.copied,
+.copy-chip.copy-failed {
+    color: transparent;
+    border-bottom-color: transparent;
+    animation: chip-flash 0.9s ease-out;
+}
+.copy-chip.copied::after,
+.copy-chip.copy-failed::after {
+    content: attr(data-label);
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    color: var(--accent);
+    white-space: nowrap;
+}
+.copy-chip.copy-failed::after {
+    color: var(--bad);
+}
+@keyframes chip-flash {
+    0% {
+        background: color-mix(in oklab, var(--accent) 35%, transparent);
+        box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent) 25%, transparent);
+    }
+    100% {
+        background: transparent;
+        box-shadow: 0 0 0 0 transparent;
+    }
+}
 .title-block h1 {
     font-size: clamp(28px, 3.4vw, 42px);
     line-height: 1.02;
@@ -490,6 +548,25 @@ h4 {
     display: flex;
     gap: 6px;
     align-items: center;
+}
+#submit-controls .btn {
+    padding: 5px 9px;
+    font-size: 10px;
+}
+/* follow-up line under the canvas footer: "posted, give it a few minutes" or
+   "still here, retry" */
+.submit-note {
+    padding: 0 2px 6px;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    line-height: 1.5;
+    color: var(--fg-mute);
+}
+.submit-note[data-tone="ok"] {
+    color: var(--ok);
+}
+.submit-note[data-tone="bad"] {
+    color: var(--bad);
 }
 
 /* ============================================================
@@ -709,48 +786,53 @@ h4 {
     display: grid;
     gap: 14px;
 }
-.lc-bignum {
-    display: grid;
-    gap: 2px;
-}
-.lc-bignum .v {
-    font-family: var(--font-mono);
-    font-size: 36px;
-    line-height: 1;
-    color: var(--accent);
-    letter-spacing: 0.02em;
-    text-shadow: 0 0 12px var(--accent-glow);
-}
-.lc-bignum .l {
-    font-family: var(--font-mono);
-    font-size: 9px;
-    letter-spacing: 0.22em;
-    text-transform: uppercase;
-    color: var(--fg-mute);
-}
-
-.lc-current {
+/* One row per monitored epoch (OPEN, settling, last accepted), newest first:
+   state with its dot on the left, epoch number on the right, a detail line
+   under it. Rows are uniform so the eye can compare them. */
+.lc-epoch {
     border-top: 1px dashed var(--rule-soft);
     padding-top: 10px;
     display: grid;
     gap: 6px;
 }
-.lc-current-head {
+.lc-epoch:first-child {
+    border-top: 0;
+    padding-top: 0;
+}
+.lc-epoch-head {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
+    gap: 8px;
 }
-.lc-current-row {
+.lc-epoch-row {
     display: flex;
     justify-content: space-between;
+    gap: 8px;
     font-family: var(--font-mono);
     font-size: 11px;
 }
-.lc-current-row .mono {
+/* the count on the left never wraps; a long detail on the right does
+   (the detail span carries both .mono and .dim, so .dim must win) */
+.lc-epoch-row .mono {
     color: var(--fg-dim);
 }
-.lc-current-row .dim {
+.lc-epoch-row > :first-child {
+    white-space: nowrap;
+    flex: 0 0 auto;
+}
+.lc-epoch-row .dim {
     color: var(--fg-mute);
+    white-space: normal;
+    flex: 1 1 auto;
+    min-width: 0;
+    text-align: right;
+    overflow-wrap: anywhere;
+}
+.lc-epoch-note {
+    font-size: 10px;
+    color: var(--fg-mute);
+    overflow-wrap: anywhere;
 }
 
 .status {
@@ -774,6 +856,9 @@ h4 {
 .status-warn {
     color: var(--warn);
 }
+.status-dim {
+    color: var(--fg-mute);
+}
 /* statusOf() has always been able to emit "accepted"; the rule was missing, so
    an accepted epoch rendered in the default colour. */
 .status-accepted {
@@ -793,7 +878,6 @@ h4 {
 
 .lc-staging,
 .lc-dispute,
-.lc-settling,
 .lc-note {
     display: flex;
     flex-direction: column;
@@ -802,15 +886,6 @@ h4 {
     border-top: 1px solid var(--line, rgba(255, 255, 255, 0.08));
     font-family: var(--font-mono);
     font-size: 11px;
-}
-
-/* "settling epoch #N · STATUS" — the epoch consensus is working on, when it is
-   not the newest one shown above it. */
-.lc-settling {
-    flex-direction: row;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
 }
 
 /* Operator-facing line: unsupported node, config mismatch, node trouble. Long
@@ -930,6 +1005,23 @@ h4 {
     height: 6px;
     background: var(--accent);
     box-shadow: 0 0 8px var(--accent-glow);
+}
+/* dot colour follows the row's state tone */
+.status-with-dot .dot[data-tone="ok"] {
+    background: var(--ok);
+    box-shadow: 0 0 8px var(--ok);
+}
+.status-with-dot .dot[data-tone="pending"] {
+    background: var(--warn);
+    box-shadow: 0 0 8px var(--warn);
+}
+.status-with-dot .dot[data-tone="bad"] {
+    background: var(--bad);
+    box-shadow: 0 0 8px var(--bad);
+}
+.status-with-dot .dot[data-tone="dim"] {
+    background: var(--fg-mute);
+    box-shadow: none;
 }
 
 .dim {
@@ -1069,12 +1161,12 @@ kbd {
 
 .how {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(5, 1fr);
     gap: 0;
     border-top: 1px solid var(--rule-soft);
     border-bottom: 1px solid var(--rule-soft);
 }
-@media (max-width: 760px) {
+@media (max-width: 900px) {
     .how {
         grid-template-columns: 1fr 1fr;
     }
@@ -1089,13 +1181,22 @@ kbd {
 .how-step:last-child {
     border-right: 0;
 }
-@media (max-width: 760px) {
-    .how-step:nth-child(2) {
+@media (max-width: 900px) {
+    .how-step:nth-child(even) {
         border-right: 0;
     }
-    .how-step:nth-child(-n + 2) {
+    .how-step:nth-child(-n + 4) {
         border-bottom: 1px solid var(--rule-soft);
     }
+    /* five steps in two columns: the last one takes the full row */
+    .how-step:last-child {
+        grid-column: 1 / -1;
+    }
+}
+.how-step code {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--fg);
 }
 .how-step .step {
     font-family: var(--font-mono);

@@ -6,8 +6,9 @@
 // - Per-row onchain verify (validateOutput)
 // - In-canvas replay (cartesi_getInput → postMessage to emulator iframe)
 // - Submit flow (rivemuOnFinish → inputBox.addInput)
-// - Rollup state (cartesi_listEpochs + getLastAcceptedEpochIndex, PRT
-//   consensus/tournaments from node snapshots)
+// - Rollup state (cartesi_listEpochs + getLastAcceptedEpochIndex; under PRT
+//   the sealed epoch's state is read from the consensus contract, tournaments
+//   from node snapshots with the on-chain counters as fallback)
 //
 // Node: rollups-node next/2.0 (PR #798 shapes). Talks to it through the thin
 // client in ./nodeRpc; the node must allow this site's origin via
@@ -28,7 +29,13 @@ import {
   toBytes,
   fromHex,
 } from "viem"; // "https://esm.sh/viem@2.50.4"; //"viem";
-import { checkPayloadSize, gasForSubmit, submitErrorMessage } from "./submit";
+import {
+  checkPayloadSize,
+  gasForSubmit,
+  submitErrorMessage,
+  runReducer,
+  canRetry,
+} from "./submit";
 import { baseSepolia, anvil, sepolia, mainnet, base } from "viem/chains"; // "https://esm.sh/viem@2.50.4/chains"; //"viem/chains";
 
 import * as CFG from "./config";
@@ -49,6 +56,11 @@ import {
   epochStatus,
   NON_TERMINAL_PAST_OPEN,
   fetchPrtState,
+  fetchConsensusState,
+  deriveLastAccepted,
+  isLivePhase,
+  inputsOf,
+  describeSettling,
   describeStaging,
   describeDispute,
   describeTree,
@@ -298,37 +310,96 @@ async function submitGameplay(payload) {
   return txHash;
 }
 
-window.addEventListener("message", async (e) => {
+// The run waiting to go on-chain, driven by runReducer (./submit.js): set when
+// a recording finishes, kept through a failed submit so it can be retried,
+// wiped by any replay so a leaderboard tape is never submitted.
+let PENDING_RUN = null;
+const SUBMIT_NOTE_MS = 20_000;
+// The node needs a moment to process the input; refresh the board a few times.
+const BOARD_REFRESH_AFTER_SUBMIT_MS = [1_500, 15_000, 60_000];
+let noteTimer = null;
+
+function dispatchRun(event) {
+  PENDING_RUN = runReducer(PENDING_RUN, event);
+  const controls = $("#submit-controls");
+  if (controls) controls.hidden = !canRetry(PENDING_RUN);
+}
+
+function showSubmitNote(text, tone) {
+  const el = $("#submit-note");
+  if (!el) return;
+  clearTimeout(noteTimer);
+  if (!text) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  el.hidden = false;
+  el.textContent = text;
+  el.dataset.tone = tone || "";
+  noteTimer = setTimeout(() => {
+    el.hidden = true;
+  }, SUBMIT_NOTE_MS);
+}
+
+const replayActive = () =>
+  $("#game-frame")?.classList.contains("is-replay") || $("#replay-controls")?.hidden === false;
+
+async function submitPending() {
+  if (!PENDING_RUN || PENDING_RUN.status === "submitting") return;
+  if (replayActive()) {
+    // Belt and braces: a replay started between the run finishing and now.
+    dispatchRun({ type: "replay" });
+    return;
+  }
+  const { payload } = PENDING_RUN;
+  dispatchRun({ type: "submit" });
+  setStatus("submitting run…");
+  showSubmitNote(null);
+  try {
+    const txHash = await submitGameplay(payload);
+    dispatchRun({ type: "ok", txHash });
+    setStatus(`submitted ✓ tx ${txHash.slice(0, 10)}…`, "ok");
+    showSubmitNote(
+      "run posted onchain · it can take a few minutes to show up on the leaderboard while the node processes it",
+      "ok",
+    );
+    for (const ms of BOARD_REFRESH_AFTER_SUBMIT_MS) setTimeout(fetchLeaderboard, ms);
+  } catch (err) {
+    console.error("submit failed:", err);
+    const chainName = getChain(CFG.CHAIN_ID)?.name ?? "this chain";
+    const reason = submitErrorMessage(err, chainName);
+    dispatchRun({ type: "failed", error: reason });
+    setStatus(`submit failed · ${reason}`, "bad");
+    showSubmitNote("your run is kept · sort out the wallet or network and retry", "bad");
+  }
+}
+
+window.addEventListener("message", (e) => {
   const params = e.data;
   if (!params || typeof params !== "object") return;
+  if (!(params.rivemuOnFinish && params.outhash && params.tape)) return;
 
-  if (params.rivemuOnFinish && params.outhash && params.tape) {
-    if ($("#replay-controls").hidden == false) {
-      return;
-    }
-    try {
-      const gameplayPayload = `0x${params.outhash}${toHex(params.tape).slice(2)}`;
-      if (!isHex(gameplayPayload)) {
-        setStatus("invalid payload", "bad");
-        return;
-      }
-      // Too long for the InputBox: say so before the wallet ever opens.
-      const size = checkPayloadSize(gameplayPayload);
-      if (!size.ok) {
-        setStatus(size.message, "bad");
-        return;
-      }
-      setStatus("submitting run…");
-      const txHash = await submitGameplay(gameplayPayload);
-      setStatus(`submitted ✓ tx ${txHash.slice(0, 10)}…`, "ok");
-      setTimeout(fetchLeaderboard, 1500);
-    } catch (err) {
-      console.error("submit failed:", err);
-      const chainName = getChain(CFG.CHAIN_ID)?.name ?? "this chain";
-      setStatus(`submit failed · ${submitErrorMessage(err, chainName)}`, "bad");
-    }
+  const gameplayPayload = `0x${params.outhash}${toHex(params.tape).slice(2)}`;
+  dispatchRun({ type: "finished", payload: gameplayPayload, replaying: replayActive() });
+  if (!PENDING_RUN) return; // a replay finished: never submit a leaderboard tape
+
+  if (!isHex(gameplayPayload)) {
+    dispatchRun({ type: "reject" });
+    setStatus("invalid payload", "bad");
+    return;
   }
+  // Too long for the InputBox: say so before the wallet ever opens.
+  const size = checkPayloadSize(gameplayPayload);
+  if (!size.ok) {
+    dispatchRun({ type: "reject" });
+    setStatus(size.message, "bad");
+    return;
+  }
+  submitPending();
 });
+
+$("#retry-submit")?.addEventListener("click", () => submitPending());
 
 // =============================================================
 // ICONS
@@ -548,6 +619,10 @@ async function loadReplay(i) {
   SELECTED_RUN_IDX = i;
   const r = BOARD[i];
   if (!r) return;
+  // A leaderboard tape is never ours to submit.
+  dispatchRun({ type: "replay" });
+  showSubmitNote(null);
+  scrollToEmulator();
   frame().classList.add("is-replay");
   $("#replay-meta").textContent =
     `run #${String(r.rank).padStart(2, "0")} · ${fmtAddrShort(r.user)}`;
@@ -599,6 +674,8 @@ async function loadReplay(i) {
 
 function exitReplay() {
   SELECTED_RUN_IDX = null;
+  dispatchRun({ type: "exit-replay" });
+  showSubmitNote(null);
   frame().classList.remove("is-replay");
   $("#replay-controls").hidden = true;
   if (__uploadListener) {
@@ -631,6 +708,39 @@ $("#rp-next")?.addEventListener("click", () => {
 });
 
 // =============================================================
+// SCROLL TO EMULATOR
+// =============================================================
+function scrollToEmulator() {
+  const el = $("#game-frame");
+  if (!el) return;
+  const r = el.getBoundingClientRect();
+  const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+  const visible = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+  if (r.height > 0 && visible / r.height >= 0.8) return; // already in view
+  const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+  el.scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "center" });
+}
+
+// The emulator is a cross-origin iframe and posts nothing when a run starts.
+// The first click inside it (the big play/record button included) moves focus
+// into the frame, which this window sees as a blur with the iframe as the
+// active element. Focus already being inside the frame (a tab switch) is
+// ignored; a click back on the page re-arms it.
+let iframeHadFocus = false;
+const emulatorEl = () => document.getElementById("emulator-iframe");
+window.addEventListener("blur", () => {
+  const inIframe = document.activeElement === emulatorEl();
+  if (inIframe && !iframeHadFocus) scrollToEmulator();
+  iframeHadFocus = inIframe;
+});
+window.addEventListener("focus", () => {
+  iframeHadFocus = document.activeElement === emulatorEl();
+});
+document.addEventListener("pointerdown", (e) => {
+  if (!emulatorEl()?.contains(e.target)) iframeHadFocus = false;
+});
+
+// =============================================================
 // LIFECYCLE
 // =============================================================
 let LIFECYCLE_STATE = {
@@ -638,21 +748,17 @@ let LIFECYCLE_STATE = {
   unsupported: null, // message when the node is not the generation we target
   fatal: null, // config error from the node: polling cannot fix it
   mismatch: [], // config.js vs node disagreements; non-empty blocks submit
-  lastAcceptedIndex: null,
+  lastAcceptedIndex: null, // node's view, or the contract's (sealed − 1), whichever is newer
+  acceptedEpoch: null, // node Epoch for lastAcceptedIndex — its input count
   currentEpoch: null, // newest epoch — where inputs go
-  settlingEpoch: null, // oldest epoch past OPEN and not settled — where consensus works
-  fetchedAt: null,
+  settlingEpoch: null, // the sealed epoch consensus is working on (node's record of it)
+  consensus: null, // fetchConsensusState — the chain's view of the sealed epoch (PRT)
   loading: false,
   error: null,
   app: null, // cached cartesi_getApplication — static config
   prt: null, // PRT view-model, null under authority/quorum
   expanded: false,
 };
-
-const inputsCount = (e) =>
-  e.inputIndexUpperBound != undefined && e.inputIndexLowerBound != undefined
-    ? Number(e.inputIndexUpperBound) - Number(e.inputIndexLowerBound)
-    : 0;
 
 const isPrt = () => LIFECYCLE_STATE.app?.consensusType === "PRT";
 
@@ -722,18 +828,44 @@ async function fetchLifecycle() {
     if (!settlingR.ok) throw settlingR.e;
 
     LIFECYCLE_STATE.currentEpoch = newestR.v.data[0] ?? null;
-    LIFECYCLE_STATE.settlingEpoch = settlingR.v.data[0] ?? null;
+    let settling = settlingR.v.data[0] ?? null;
 
     // "No accepted epoch yet" is a state, not an error.
-    if (lastR.ok) LIFECYCLE_STATE.lastAcceptedIndex = lastR.v;
-    else if (isNotFound(lastR.e)) LIFECYCLE_STATE.lastAcceptedIndex = null;
+    let nodeLastAccepted;
+    if (lastR.ok) nodeLastAccepted = lastR.v;
+    else if (isNotFound(lastR.e)) nodeLastAccepted = null;
     else throw lastR.e;
 
-    // Tournaments only exist under PRT and only for a sealed epoch. Under
-    // authority/quorum this is skipped entirely and no chain calls are issued.
-    const settling = LIFECYCLE_STATE.settlingEpoch;
+    // Under PRT the chain decides which epoch is sealed and what state it is
+    // in; the node's label for it can be stale (a claim it computed but never
+    // submitted stays CLAIM_COMPUTED while the tournament fails on-chain).
+    // Under authority/quorum no chain calls are issued.
+    let consensus = null;
+    if (isPrt()) {
+      consensus = await fetchConsensusState({
+        l1Client,
+        consensusAddress: LIFECYCLE_STATE.app?.consensusAddress,
+        // counters only matter when the node has no tournament rows; the
+        // previous poll tells us whether it did
+        nodeHasTournaments: (LIFECYCLE_STATE.prt?.tournaments?.length ?? 0) > 0,
+      });
+      // Use the node's record of the sealed epoch itself (for its label and
+      // bounds), not whichever epoch the node thinks it is working on.
+      if (
+        consensus &&
+        (!settling || BigInt(settling.index) !== BigInt(consensus.epochNumber))
+      ) {
+        const r = await safe(
+          nodeClient.getEpoch({ application: APP_REF, epochIndex: consensus.epochNumber }),
+        );
+        settling = r.ok ? r.v : null;
+      }
+    }
+    LIFECYCLE_STATE.settlingEpoch = settling;
+    LIFECYCLE_STATE.consensus = consensus;
+
     LIFECYCLE_STATE.prt =
-      isPrt() && settling
+      isPrt() && (settling || consensus)
         ? await fetchPrtState({
             nodeClient,
             l1Client,
@@ -741,8 +873,23 @@ async function fetchLifecycle() {
             consensusAddress: LIFECYCLE_STATE.app?.consensusAddress,
             epoch: settling,
             claimStagingPeriod: LIFECYCLE_STATE.app?.claimStagingPeriod,
+            consensus,
           })
         : null;
+
+    // Last accepted: the node's index or the contract's implied one, whichever
+    // is newer; fetch that epoch once for its input count.
+    const lastIdx = deriveLastAccepted(nodeLastAccepted, consensus);
+    LIFECYCLE_STATE.lastAcceptedIndex = lastIdx;
+    if (lastIdx == null) {
+      LIFECYCLE_STATE.acceptedEpoch = null;
+    } else if (
+      LIFECYCLE_STATE.acceptedEpoch == null ||
+      BigInt(LIFECYCLE_STATE.acceptedEpoch.index) !== BigInt(lastIdx)
+    ) {
+      const r = await safe(nodeClient.getEpoch({ application: APP_REF, epochIndex: lastIdx }));
+      LIFECYCLE_STATE.acceptedEpoch = r.ok ? r.v : null;
+    }
 
     LIFECYCLE_STATE.error = null;
     pollBackoff = 1;
@@ -759,12 +906,13 @@ async function fetchLifecycle() {
     } else {
       LIFECYCLE_STATE.error = humanError(e);
       LIFECYCLE_STATE.lastAcceptedIndex = null;
+      LIFECYCLE_STATE.acceptedEpoch = null;
       LIFECYCLE_STATE.currentEpoch = null;
       LIFECYCLE_STATE.settlingEpoch = null;
+      LIFECYCLE_STATE.consensus = null;
       LIFECYCLE_STATE.prt = null;
     }
   }
-  LIFECYCLE_STATE.fetchedAt = new Date();
   LIFECYCLE_STATE.loading = false;
   renderLifecycle();
   if (!LIFECYCLE_STATE.unsupported && !LIFECYCLE_STATE.fatal) schedulePoll();
@@ -773,28 +921,38 @@ async function fetchLifecycle() {
 // ~2s blocks on Base Sepolia; good enough to turn a block delta into a feel.
 const BLOCK_SECONDS = 2;
 
+const fmtInputs = (n) => (n == null ? "— inputs" : `${n} input${n === 1 ? "" : "s"}`);
+
+// One epoch row: state (with its dot) on the left, epoch number on the right.
+function setEpochHead(id, label, tone, index, pulse) {
+  const st = $(`#lc-${id}-status`);
+  if (st) {
+    st.textContent = label;
+    st.className = `status status-${tone}`;
+  }
+  const dot = $(`#lc-${id}-dot`);
+  if (dot) {
+    dot.dataset.tone = tone;
+    dot.classList.toggle("pulse", !!pulse);
+  }
+  const idx = $(`#lc-${id}-idx`);
+  if (idx) idx.textContent = index == null ? "epoch —" : `epoch #${index}`;
+}
+
 function renderLifecycle() {
   const {
     lastAcceptedIndex,
+    acceptedEpoch,
     currentEpoch,
     settlingEpoch,
-    fetchedAt,
+    consensus,
     error,
-    loading,
     prt,
     app,
     unsupported,
     fatal,
     mismatch,
   } = LIFECYCLE_STATE;
-
-  $("#lc-last").textContent =
-    lastAcceptedIndex == null ? "—" : `#${lastAcceptedIndex}`;
-  $("#lc-fetched-pill").textContent = loading
-    ? "fetching…"
-    : fetchedAt
-      ? fmtAge(fetchedAt.getTime())
-      : "—";
 
   const consensusPill = $("#lc-consensus-pill");
   if (consensusPill) {
@@ -804,31 +962,58 @@ function renderLifecycle() {
       : "";
   }
 
-  if (currentEpoch) {
-    const st = epochStatus(currentEpoch);
-    $("#lc-current-status").textContent = st.label;
-    $("#lc-current-status").className = `status status-${st.tone}`;
-    $("#lc-current-idx").textContent = `epoch #${currentEpoch.index}`;
-    $("#lc-current-inputs").textContent = `${inputsCount(currentEpoch)} inputs`;
-    $("#lc-current-age").textContent = currentEpoch.updatedAt
-      ? fmtAge(new Date(currentEpoch.updatedAt).getTime())
-      : "—";
-    $("#lc-current").style.display = "";
-  } else {
-    $("#lc-current").style.display = "none";
+  // ---- settling (sealed) epoch: contract phase first, node label as a note
+  const settling = describeSettling({ epoch: settlingEpoch, consensus, prt });
+
+  // ---- OPEN (newest) epoch; folded into the settling row when it is the same
+  const openEl = $("#lc-open");
+  const openIsSettling =
+    !!currentEpoch &&
+    !!settling &&
+    settling.epochIndex != null &&
+    BigInt(currentEpoch.index) === BigInt(settling.epochIndex);
+  if (openEl) {
+    if (currentEpoch && !openIsSettling) {
+      const st = epochStatus(currentEpoch);
+      setEpochHead("open", st.label, st.tone, currentEpoch.index, st.tone === "open");
+      $("#lc-open-inputs").textContent = fmtInputs(inputsOf(currentEpoch));
+      $("#lc-open-age").textContent = currentEpoch.updatedAt
+        ? `updated ${fmtAge(new Date(currentEpoch.updatedAt).getTime())}`
+        : "";
+      openEl.hidden = false;
+    } else {
+      openEl.hidden = true;
+    }
   }
 
-  // The epoch consensus is working on, when it is not the one shown above.
   const settlingEl = $("#lc-settling");
   if (settlingEl) {
-    const show =
-      settlingEpoch && (!currentEpoch || settlingEpoch.index !== currentEpoch.index);
-    settlingEl.hidden = !show;
-    if (show) {
-      const st = epochStatus(settlingEpoch);
-      $("#lc-settling-idx").textContent = `settling epoch #${settlingEpoch.index}`;
-      $("#lc-settling-status").textContent = st.label;
-      $("#lc-settling-status").className = `status status-${st.tone}`;
+    if (settling) {
+      const live = isLivePhase({ key: settling.key });
+      setEpochHead("settling", settling.label, settling.tone, settling.epochIndex, live);
+      $("#lc-settling-inputs").textContent = fmtInputs(settling.inputs);
+      $("#lc-settling-detail").textContent = settling.detail ?? "";
+      const noteEl = $("#lc-settling-node");
+      noteEl.hidden = !settling.nodeNote;
+      noteEl.textContent = settling.nodeNote ?? "";
+      settlingEl.hidden = false;
+    } else {
+      settlingEl.hidden = true;
+    }
+  }
+
+  // ---- last accepted epoch
+  if ($("#lc-accepted")) {
+    if (lastAcceptedIndex != null) {
+      setEpochHead("accepted", "ACCEPTED", "ok", lastAcceptedIndex, false);
+      $("#lc-accepted-inputs").textContent = acceptedEpoch
+        ? fmtInputs(inputsOf(acceptedEpoch))
+        : "— inputs";
+      $("#lc-accepted-detail").textContent = "";
+    } else {
+      setEpochHead("accepted", "ACCEPTED", "dim", null, false);
+      $("#lc-accepted-inputs").textContent = "no accepted epoch yet";
+      $("#lc-accepted-detail").textContent = "";
     }
   }
 
@@ -855,12 +1040,6 @@ function renderLifecycle() {
     note.className = `lc-note mono status-${tone}`;
   }
   if (mismatch.length) setStatus("config mismatch — submissions disabled", "bad");
-
-  const unreachable = !!(error || unsupported || fatal);
-  $("#lc-app-pill").textContent = unreachable
-    ? `live unreachable`
-    : fmtAddrShort(app?.applicationAddress ?? CFG.APPLICATION_ADDRESS);
-  $("#lc-app-pill").style.color = unreachable ? "var(--bad)" : "";
 
   // The How-modal shows both values when they differ, so the operator can see
   // which side is stale.
@@ -896,9 +1075,17 @@ function renderDispute(prt) {
   }
   el.hidden = false;
 
+  // The row head above already names the phase when the chain provided it;
+  // repeat the standing only when it adds something.
+  const head = describeSettling({
+    epoch: LIFECYCLE_STATE.settlingEpoch,
+    consensus: LIFECYCLE_STATE.consensus,
+    prt,
+  });
   const badge = $("#lc-dispute-standing");
   badge.textContent = d.standing.label;
   badge.className = `status status-${d.standing.tone}`;
+  badge.hidden = !!head && head.label === d.standing.label;
   $("#lc-dispute-meta").textContent = d.meta;
   $("#lc-dispute-toggle").textContent = LIFECYCLE_STATE.expanded
     ? "hide tournament ▴"
@@ -998,10 +1185,48 @@ $("#reload-btn")?.addEventListener("click", async () => {
 });
 
 // =============================================================
-// cartridge label
+// cartridge label — click to copy the application address
 // =============================================================
-$("#cartridge-id").textContent = fmtAddrShort(CFG.APPLICATION_ADDRESS);
-$("#cartridge-id").title = CFG.APPLICATION_ADDRESS;
+async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) {
+    // insecure context or permission denied: fall through
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+{
+  const chip = $("#cartridge-id");
+  let copyTimer = null;
+  chip.textContent = fmtAddrShort(CFG.APPLICATION_ADDRESS);
+  chip.title = `${CFG.APPLICATION_ADDRESS} · click to copy`;
+  chip.addEventListener("click", async () => {
+    const ok = await copyText(CFG.APPLICATION_ADDRESS);
+    chip.classList.remove("copied", "copy-failed");
+    void chip.offsetWidth; // restart the flash animation on rapid clicks
+    chip.dataset.label = ok ? "copied ✓" : "copy failed";
+    chip.classList.add(ok ? "copied" : "copy-failed");
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => chip.classList.remove("copied", "copy-failed"), 1200);
+  });
+}
 
 // =============================================================
 // boot — fetch both, then poll (cadence: see POLL_* above)
@@ -1016,6 +1241,7 @@ function pollInterval() {
     const contested = prt.disputed && prt.activeMatchCount > 0;
     if (counting || contested) base = POLL_LIVE;
   }
+  if (isLivePhase(LIFECYCLE_STATE.consensus?.phase)) base = POLL_LIVE;
   // Transient node trouble stretches the interval; see fetchLifecycle().
   return Math.min(base * pollBackoff, POLL_MAX);
 }

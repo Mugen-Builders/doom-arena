@@ -35,6 +35,19 @@ export const daveConsensusAbi = parseAbi([
   "function hasSentryClaimedInEpoch(uint256 epochNumber, uint256 sentryId) view returns (bool)",
 ]);
 
+// -------------------------------------------------------------
+// ABI — ITournament reads, Dave v3.0.0-alpha.5
+// Verified against the same artifact set. Read directly when the node has not
+// indexed the tournament (live Base Sepolia: last_tournament_check_block = 0).
+// -------------------------------------------------------------
+export const tournamentAbi = parseAbi([
+  "function tournamentStanding() view returns ((uint8 standing, bool acceptsJoins, bool hasCandidate, bytes32 candidate, bytes32 finalState, bytes32 parentCommitment, uint64 finishedAt, uint64 winnerExpiresAt))",
+  "function getCommitmentJoinedCount() view returns (uint256)",
+  "function getMatchCreatedCount() view returns (uint256)",
+  "function getMatchDeletedCount() view returns (uint256)",
+  "function getNewInnerTournamentCount() view returns (uint256)",
+]);
+
 // `doAllSentriesAgreeWithStagedTournamentResult` is the contract's FAST PATH:
 // true only when every sentry has claimed the staged hash, which lets the
 // result be accepted before the staging period ends. It is false with zero
@@ -113,6 +126,21 @@ export const standingOf = (key) => {
     : { key: k ? `UNKNOWN_${k}` : "UNKNOWN", label: "UNKNOWN", tone: "pending" };
 };
 
+// Solidity enum order of ITournament.TournamentStanding (alpha.5). The
+// contract returns the index; the node returns the name. Pinned by test.
+export const TOURNAMENT_STANDING_INDEX = [
+  "MATCHES_ACTIVE",
+  "AWAITING_CLOSURE",
+  "ROOT_WINNER",
+  "ROOT_FAILED",
+  "INNER_WINNER",
+  "INNER_ELIMINABLE_NO_WINNER",
+  "INNER_ELIMINABLE_WINNER_EXPIRED",
+];
+
+export const standingFromIndex = (i) =>
+  i == null ? null : standingOf(TOURNAMENT_STANDING_INDEX[Number(i)] ?? `#${i}`);
+
 export const MATCH_PHASE = [
   "UNINITIALIZED",
   "BISECTING",
@@ -157,6 +185,16 @@ const totalCount = (r) => Number(r?.pagination?.totalCount ?? rows(r).length);
 const maxBig = (values) =>
   values.reduce((m, v) => (v != null && (m == null || v > m) ? v : m), null);
 
+const sameAddress = (a, b) =>
+  !!a && !!b && String(a).toLowerCase() === String(b).toLowerCase();
+const isZeroAddress = (a) => !a || /^0x0{40}$/i.test(String(a));
+
+// Inputs an epoch spans, from its index bounds (node Epoch or contract view).
+export const inputsOf = (e) =>
+  e?.inputIndexUpperBound != null && e?.inputIndexLowerBound != null
+    ? Number(BigInt(e.inputIndexUpperBound) - BigInt(e.inputIndexLowerBound))
+    : null;
+
 // -------------------------------------------------------------
 // tree
 // -------------------------------------------------------------
@@ -193,12 +231,146 @@ export function buildTournamentTree(tournaments) {
 }
 
 // -------------------------------------------------------------
+// consensus state — straight from the contracts
+//
+// The node's epoch status is what the node has *done*, not what the chain
+// says. A node that computed a claim and never submitted it reports
+// CLAIM_COMPUTED forever while the tournament on-chain times out and fails.
+// The sealed epoch, its tournament and their standing are read here and win
+// over the node's label; the node's label is kept as a secondary note.
+// -------------------------------------------------------------
+
+/**
+ * Read the current sealed epoch and its root tournament. Never throws;
+ * returns null when there is no chain client / consensus address or the
+ * primary read fails. viem's batch transport collapses the calls.
+ *
+ * `nodeHasTournaments` skips the match/inner counters when the node already
+ * serves tournament rows (they only feed the degrade path).
+ */
+export async function fetchConsensusState({
+  l1Client,
+  consensusAddress,
+  nodeHasTournaments = true,
+}) {
+  if (!l1Client || !consensusAddress) return null;
+  const read = (address, abi, functionName, args = []) =>
+    safe(l1Client.readContract({ address, abi, functionName, args }));
+
+  const [sealed, canStage, blockNumber] = await Promise.all([
+    read(consensusAddress, daveConsensusAbi, "getCurrentSealedEpoch"),
+    read(consensusAddress, daveConsensusAbi, "canStageTournamentResult"),
+    safe(l1Client.getBlockNumber()),
+  ]);
+  if (!sealed) return null;
+
+  const out = {
+    consensusAddress,
+    epochNumber: sealed[0],
+    inputIndexLowerBound: sealed[1],
+    inputIndexUpperBound: sealed[2],
+    tournament: isZeroAddress(sealed[3]) ? null : sealed[3],
+    staged: sealed[4] === true,
+    stagingBlockNumber: sealed[5] ?? null,
+    isFinished: canStage ? canStage[0] === true : null,
+    isFailed: canStage ? canStage[1] === true : null,
+    standing: null,
+    acceptsJoins: null,
+    finishedAt: null,
+    joined: null,
+    matchesCreated: null,
+    matchesDeleted: null,
+    innerTournaments: null,
+    canAccept: null, // canAcceptStagedTournamentResult tuple, when staged
+    currentBlock: blockNumber,
+  };
+
+  const t = out.tournament;
+  const [standing, joined, canAccept, created, deleted, inner] = await Promise.all([
+    t ? read(t, tournamentAbi, "tournamentStanding") : null,
+    t ? read(t, tournamentAbi, "getCommitmentJoinedCount") : null,
+    out.staged ? read(consensusAddress, daveConsensusAbi, "canAcceptStagedTournamentResult") : null,
+    t && !nodeHasTournaments ? read(t, tournamentAbi, "getMatchCreatedCount") : null,
+    t && !nodeHasTournaments ? read(t, tournamentAbi, "getMatchDeletedCount") : null,
+    t && !nodeHasTournaments ? read(t, tournamentAbi, "getNewInnerTournamentCount") : null,
+  ]);
+  if (standing) {
+    // viem returns named tuples as objects; tolerate positional too.
+    const idx = standing.standing ?? standing[0];
+    out.standing = standingFromIndex(idx);
+    out.acceptsJoins = standing.acceptsJoins ?? standing[1] ?? null;
+    out.finishedAt = standing.finishedAt ?? standing[6] ?? null;
+  }
+  out.joined = joined;
+  out.canAccept = canAccept;
+  out.matchesCreated = created;
+  out.matchesDeleted = deleted;
+  out.innerTournaments = inner;
+  out.phase = consensusPhase(out);
+  return out;
+}
+
+/**
+ * What the sealed epoch is doing, in contract terms. Order matters: staging
+ * and a finished tournament are decided by the consensus contract; the rest
+ * by the tournament's standing and whether anyone has claimed at all.
+ */
+export function consensusPhase(c) {
+  if (!c) return null;
+  if (c.staged) {
+    const over = c.canAccept ? c.canAccept[2] === true : false;
+    return over
+      ? { key: "AWAITING_ACCEPTANCE", label: "AWAITING ACCEPTANCE", tone: "pending", detail: "staging period over · anyone may accept the result" }
+      : { key: "STAGED", label: "STAGED", tone: "pending", detail: null };
+  }
+  if (c.isFinished && c.isFailed)
+    return { key: "FAILED", label: "TOURNAMENT FAILED", tone: "bad", detail: "no claim within allowance · epoch cannot settle" };
+  if (c.isFinished)
+    return { key: "AWAITING_STAGING", label: "SETTLED · AWAITING STAGING", tone: "pending", detail: "winner decided · anyone may stage the result" };
+  const s = c.standing?.key;
+  const joined = c.joined == null ? null : Number(c.joined);
+  if (s === "MATCHES_ACTIVE")
+    return { key: "DISPUTE", label: "DISPUTE ACTIVE", tone: "bad", detail: null };
+  if (joined === 0)
+    return { key: "AWAITING_CLAIM", label: "AWAITING CLAIM", tone: "pending", detail: "no claim submitted yet" };
+  if (s === "AWAITING_CLOSURE" || joined != null)
+    return {
+      key: "IN_TOURNAMENT",
+      label: "IN TOURNAMENT",
+      tone: "pending",
+      detail: joined == null ? "challenge window open" : `${joined} claim${joined === 1 ? "" : "s"} · challenge window open`,
+    };
+  return { key: "SEALED", label: "SEALED", tone: "pending", detail: null };
+}
+
+/** Phases worth polling fast for: a countdown or a fight. A plain challenge
+ * window (IN_TOURNAMENT) lasts hours and is not worth hammering the RPC. */
+export const isLivePhase = (phase) => ["DISPUTE", "STAGED"].includes(phase?.key);
+
+/**
+ * The newest accepted epoch. The node knows it from events it indexed; the
+ * contract implies it: epoch N is sealed only once N-1 was accepted.
+ */
+export function deriveLastAccepted(nodeIndex, consensus) {
+  const fromChain =
+    consensus?.epochNumber != null && BigInt(consensus.epochNumber) > 0n
+      ? BigInt(consensus.epochNumber) - 1n
+      : null;
+  if (nodeIndex == null) return fromChain;
+  if (fromChain == null) return BigInt(nodeIndex);
+  return BigInt(nodeIndex) > fromChain ? BigInt(nodeIndex) : fromChain;
+}
+
+// -------------------------------------------------------------
 // main fetch
 // -------------------------------------------------------------
 
 /**
  * Collect PRT status for one epoch: three node list calls, one eth_call for a
  * staged claim, and one eth_blockNumber when an L1 client is available.
+ * With `consensus` (fetchConsensusState) the chain block, staging tuple and
+ * root standing come from there, and a tournament the node never indexed is
+ * still shown from its on-chain counters.
  *
  * Never throws: every read is individually guarded.
  */
@@ -209,9 +381,10 @@ export async function fetchPrtState({
   consensusAddress,
   epoch,
   claimStagingPeriod,
+  consensus = null,
 }) {
   const out = {
-    epochIndex: epoch?.index ?? null,
+    epochIndex: epoch?.index ?? consensus?.epochNumber ?? null,
     consensusAddress: consensusAddress ?? null,
     tournaments: [],
     order: [],
@@ -226,10 +399,10 @@ export async function fetchPrtState({
     currentBlock: null,
     asOfBlock: null, // block the node's snapshots were read at
     snapshotOk: null, // false when tournaments exist without snapshots
+    chainCounts: null, // counters read from the tournament when the node has no rows
   };
-  if (!epoch || !nodeClient) return out;
-
-  const epochIndex = epoch.index;
+  const epochIndex = out.epochIndex;
+  if (epochIndex == null || !nodeClient) return out;
 
   // Counts come from pagination.totalCount and stay exact; only the rendered
   // detail truncates at 50, which no realistic dispute on this app reaches.
@@ -263,9 +436,30 @@ export async function fetchPrtState({
   out.root =
     roots.find((r) => Number(r.level) === 0) ??
     roots[0] ??
-    (epoch.tournamentAddress
+    (epoch?.tournamentAddress
       ? { address: epoch.tournamentAddress, level: 0n, children: [], standing: null }
       : null);
+
+  // The node may not have indexed the tournament at all; the contract still
+  // knows the root and its standing.
+  const chainRoot = consensus?.tournament ?? null;
+  if (!out.root && chainRoot) {
+    out.root = { address: chainRoot, level: 0n, children: [], standing: consensus.standing ?? null, fromChain: true };
+  }
+  if (out.root && !out.root.standing && consensus?.standing && sameAddress(out.root.address, chainRoot)) {
+    out.root.standing = consensus.standing;
+  }
+  if (out.root && !out.order.length) out.order = [{ node: out.root, depth: 0 }];
+  if (consensus && !out.tournaments.length && consensus.joined != null) {
+    const n = (v) => (v == null ? 0 : Number(v));
+    out.chainCounts = {
+      joined: n(consensus.joined),
+      matchesCreated: n(consensus.matchesCreated),
+      matchesDeleted: n(consensus.matchesDeleted),
+      innerTournaments: n(consensus.innerTournaments),
+    };
+    if (out.chainCounts.joined > 1 || out.chainCounts.matchesCreated > 0) out.disputed = true;
+  }
 
   if (out.tournaments.length)
     out.snapshotOk = out.tournaments.every((t) => t.snapshot != null);
@@ -277,7 +471,8 @@ export async function fetchPrtState({
   ]);
 
   // Freshest block we can get: the chain if it answers, else the node's view.
-  const chainBlock = l1Client ? await safe(l1Client.getBlockNumber()) : null;
+  const chainBlock =
+    consensus?.currentBlock ?? (l1Client ? await safe(l1Client.getBlockNumber()) : null);
   out.currentBlock = chainBlock ?? out.asOfBlock;
 
   // ---- matches: phase + clocks from snapshots ----
@@ -314,7 +509,10 @@ export async function fetchPrtState({
   }
 
   // ---- staging ----
-  if (epochStatus(epoch).label === "STAGED") {
+  // The contract decides whether the claim is staged; the node's label is the
+  // fallback when no chain state was read.
+  const isStaged = consensus ? consensus.staged : epochStatus(epoch).label === "STAGED";
+  if (isStaged) {
     const read = (functionName, args = []) =>
       l1Client && consensusAddress
         ? safe(
@@ -328,7 +526,7 @@ export async function fetchPrtState({
         : Promise.resolve(null);
 
     const [can, sentryCount] = await Promise.all([
-      read("canAcceptStagedTournamentResult"),
+      consensus?.canAccept ?? read("canAcceptStagedTournamentResult"),
       read("getNumberOfSentries"),
     ]);
 
@@ -355,13 +553,14 @@ export async function fetchPrtState({
     }
 
     let blocksLeft = null;
+    const stagedAt = epoch?.stagedAtBlock ?? consensus?.stagingBlockNumber ?? null;
     if (
-      epoch.stagedAtBlock != null &&
+      stagedAt != null &&
       claimStagingPeriod != null &&
       out.currentBlock != null
     ) {
       const left =
-        BigInt(epoch.stagedAtBlock) +
+        BigInt(stagedAt) +
         BigInt(claimStagingPeriod) -
         BigInt(out.currentBlock);
       blocksLeft = left > 0n ? left : 0n;
@@ -440,17 +639,26 @@ export function describeStaging(prt, secondsPerBlock = 2) {
   };
 }
 
-/** Summary line for the collapsed dispute row. */
+/** Summary line for the collapsed dispute row (the row head names the epoch). */
 export function describeDispute(prt) {
   if (!prt?.disputed) return null;
   const bits = [];
-  if (prt.epochIndex != null) bits.push(`epoch #${prt.epochIndex}`);
-  bits.push(
-    `${prt.commitmentCount} commitments`,
-    `${prt.activeMatchCount}/${prt.matchCount} matches active`,
-  );
-  if (prt.tournaments.length > 1)
-    bits.push(`${prt.tournaments.length} tournaments`);
+  const c = prt.chainCounts;
+  if (c) {
+    bits.push(
+      `${c.joined} commitments`,
+      `${c.matchesCreated - c.matchesDeleted}/${c.matchesCreated} matches active`,
+    );
+    if (c.innerTournaments > 0) bits.push(`${c.innerTournaments} inner tournaments`);
+    bits.push("from chain");
+  } else {
+    bits.push(
+      `${prt.commitmentCount} commitments`,
+      `${prt.activeMatchCount}/${prt.matchCount} matches active`,
+    );
+    if (prt.tournaments.length > 1)
+      bits.push(`${prt.tournaments.length} tournaments`);
+  }
   return {
     standing: prt.root?.standing ?? { label: "DISPUTE", tone: "bad" },
     meta: bits.join(" · "),
@@ -505,6 +713,13 @@ export function describeTree(prt, secondsPerBlock = 2) {
     }
   }
 
+  if (prt.chainCounts) {
+    const c = prt.chainCounts;
+    out.push({
+      kind: "note",
+      label: `node has not indexed this tournament · chain: ${c.joined} commitments · ${c.matchesCreated} matches (${c.matchesDeleted} ended) · ${c.innerTournaments} inner`,
+    });
+  }
   if (prt.snapshotOk === false)
     out.push({
       kind: "note",
@@ -522,4 +737,45 @@ export function describeTree(prt, secondsPerBlock = 2) {
     });
   }
   return out;
+}
+
+/**
+ * The settling epoch row: contract phase first, node status as a note when it
+ * disagrees. Without chain state this is just the node's status.
+ * Returns null when there is nothing to show.
+ */
+export function describeSettling({ epoch = null, consensus = null, prt = null } = {}) {
+  const phase = consensusPhase(consensus);
+  const nodeSt = epoch ? epochStatus(epoch) : null;
+  if (!phase) {
+    if (!epoch) return null;
+    return {
+      source: "node",
+      key: null,
+      label: nodeSt.label,
+      tone: nodeSt.tone,
+      epochIndex: epoch.index ?? null,
+      inputs: inputsOf(epoch),
+      detail: null,
+      nodeNote: null,
+    };
+  }
+  let detail = phase.detail;
+  // The dispute line under the row carries the counts; do not say them twice.
+  if (phase.key === "DISPUTE" && prt?.disputed) detail = null;
+  let nodeNote = null;
+  if (!epoch) nodeNote = `node has no epoch #${consensus.epochNumber} yet`;
+  else if (epoch.index != null && BigInt(epoch.index) !== BigInt(consensus.epochNumber))
+    nodeNote = `node is on epoch #${epoch.index} · ${nodeSt.label}`;
+  else if (nodeSt.label !== phase.label) nodeNote = `node: ${nodeSt.label}`;
+  return {
+    source: "chain",
+    key: phase.key,
+    label: phase.label,
+    tone: phase.tone,
+    epochIndex: consensus.epochNumber,
+    inputs: inputsOf(consensus) ?? inputsOf(epoch),
+    detail,
+    nodeNote,
+  };
 }

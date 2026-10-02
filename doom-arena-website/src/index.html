@@ -39,7 +39,7 @@
       <div class="title-block">
         <div class="eyebrow">
           Freedoom //
-          <span class="mono" id="cartridge-id">0xA18d…80C0</span>
+          <button type="button" class="mono copy-chip" id="cartridge-id" title="copy application address" data-label="copied ✓">—</button>
           <span style="color:var(--accent);margin-left:8px">●</span>
           <span style="margin-left:4px" id="hero-chain">LIVE ON BASE-SEPOLIA</span>
         </div>
@@ -97,7 +97,13 @@
             <button class="ico-btn" id="rp-prev" title="Previous run">◀◀</button>
             <button class="ico-btn" id="rp-next" title="Next run">▶▶</button>
           </div>
+          <!-- Shown only while a recorded run failed to submit -->
+          <div class="canvas-foot-right" id="submit-controls" hidden>
+            <button class="btn ghost" id="retry-submit" title="Submit the last run again">↻ retry submit</button>
+          </div>
         </div>
+        <!-- One-line follow-up after a submission (auto-hides) -->
+        <div class="submit-note mono" id="submit-note" hidden></div>
       </div>
 
       <!-- RIGHT: side panel -->
@@ -114,66 +120,84 @@
           </div>
         </div>
 
-        <!-- Rollup state — compact -->
+        <!-- Rollup state — the three epochs that matter, newest first:
+             the OPEN epoch collecting inputs, the sealed epoch consensus is
+             settling (state read from the contracts under PRT), and the last
+             accepted one. Each row: state left, epoch number right. -->
         <div class="panel" id="lifecycle">
           <div class="panel-head">
             <span class="label">Rollup state</span>
             <span class="lc-head-right">
               <span class="label dim" id="lc-consensus-pill" title="consensus mechanism">—</span>
-              <span class="label dim" id="lc-fetched-pill">—</span>
             </span>
           </div>
 
           <div class="lc-compact-mini">
-            <div class="lc-bignum">
-              <span class="v" id="lc-last">—</span>
-              <span class="l">last accepted epoch</span>
-            </div>
-
-            <div class="lc-current" id="lc-current">
-              <div class="lc-current-head">
+            <div class="lc-epoch" id="lc-open">
+              <div class="lc-epoch-head">
                 <span class="status-with-dot">
-                  <span class="dot pulse" id="lc-current-dot"></span>
-                  <span class="status status-open" id="lc-current-status">OPEN</span>
+                  <span class="dot pulse" id="lc-open-dot" data-tone="open"></span>
+                  <span class="status status-open" id="lc-open-status">OPEN</span>
                 </span>
-                <span class="mono dim" id="lc-current-idx">epoch #—</span>
+                <span class="mono dim" id="lc-open-idx">epoch —</span>
               </div>
-              <div class="lc-current-row">
-                <span class="mono" id="lc-current-inputs">— inputs</span>
-                <span class="mono dim" id="lc-current-age">—</span>
+              <div class="lc-epoch-row">
+                <span class="mono" id="lc-open-inputs">— inputs</span>
+                <span class="mono dim" id="lc-open-age">—</span>
               </div>
             </div>
 
-            <!-- Hidden while the newest epoch is also the one being settled -->
-            <div class="lc-settling" id="lc-settling" hidden>
-              <span class="mono dim" id="lc-settling-idx">settling epoch #—</span>
-              <span class="status status-pending" id="lc-settling-status">—</span>
-            </div>
-
-            <!-- PRT only; hidden unless the claim is staged -->
-            <div class="lc-staging" id="lc-staging" hidden>
-              <span class="mono dim" id="lc-staging-text">—</span>
-            </div>
-
-            <!-- PRT only; hidden unless a dispute exists -->
-            <div class="lc-dispute" id="lc-dispute" hidden>
-              <div class="lc-dispute-head">
-                <span class="status status-bad" id="lc-dispute-standing">DISPUTE</span>
-                <button class="lc-link" id="lc-dispute-toggle" type="button">
-                  show tournament ▾
-                </button>
+            <!-- Hidden under authority consensus or when nothing is sealed -->
+            <div class="lc-epoch" id="lc-settling" hidden>
+              <div class="lc-epoch-head">
+                <span class="status-with-dot">
+                  <span class="dot" id="lc-settling-dot" data-tone="pending"></span>
+                  <span class="status status-pending" id="lc-settling-status">—</span>
+                </span>
+                <span class="mono dim" id="lc-settling-idx">epoch —</span>
               </div>
-              <span class="mono dim" id="lc-dispute-meta">—</span>
+              <div class="lc-epoch-row">
+                <span class="mono" id="lc-settling-inputs">— inputs</span>
+                <span class="mono dim" id="lc-settling-detail"></span>
+              </div>
+              <!-- The node's own label when it disagrees with the chain -->
+              <div class="lc-epoch-note mono" id="lc-settling-node" hidden></div>
+
+              <!-- PRT only; hidden unless the claim is staged -->
+              <div class="lc-staging" id="lc-staging" hidden>
+                <span class="mono dim" id="lc-staging-text">—</span>
+              </div>
+
+              <!-- PRT only; hidden unless a dispute exists -->
+              <div class="lc-dispute" id="lc-dispute" hidden>
+                <div class="lc-dispute-head">
+                  <span class="status status-bad" id="lc-dispute-standing">DISPUTE</span>
+                  <button class="lc-link" id="lc-dispute-toggle" type="button">
+                    show tournament ▾
+                  </button>
+                </div>
+                <span class="mono dim" id="lc-dispute-meta">—</span>
+              </div>
+
+              <div class="lc-tree" id="lc-tree" hidden></div>
             </div>
 
-            <div class="lc-tree" id="lc-tree" hidden></div>
+            <div class="lc-epoch" id="lc-accepted">
+              <div class="lc-epoch-head">
+                <span class="status-with-dot">
+                  <span class="dot" id="lc-accepted-dot" data-tone="dim"></span>
+                  <span class="status status-dim" id="lc-accepted-status">ACCEPTED</span>
+                </span>
+                <span class="mono dim" id="lc-accepted-idx">epoch —</span>
+              </div>
+              <div class="lc-epoch-row">
+                <span class="mono" id="lc-accepted-inputs">—</span>
+                <span class="mono dim" id="lc-accepted-detail"></span>
+              </div>
+            </div>
 
             <!-- Operator-facing: unsupported node, config mismatch, node trouble -->
             <div class="lc-note mono" id="lc-note" hidden></div>
-          </div>
-
-          <div class="panel-foot">
-            <span class="mono dim" id="lc-app-pill">0xA18d…80C0</span>
           </div>
         </div>
 
@@ -244,18 +268,23 @@
           <div class="how-step">
             <span class="step">STEP 04</span>
             <h4>Epoch closes</h4>
-            <p>The node submits an epoch claim onchain with the root-hash of its inputs. Under PRT consensus, anyone may challenge that claim: the disagreement is settled by an onchain tournament, which bisects the disputed computation until a single wrong step can be proven. Once the epoch is accepted, your score is set and anyone can verify it onchain.</p>
+            <p>The node submits an epoch claim onchain with the root-hash of its inputs. Under PRT consensus, anyone may challenge that claim: the disagreement is settled by an onchain tournament, which bisects the disputed computation until a single wrong step can be proven. Once the epoch is accepted, your score is final.</p>
+          </div>
+          <div class="how-step">
+            <span class="step">STEP 05</span>
+            <h4>Verify the score onchain</h4>
+            <p>Every score notice carries a Merkle proof against the accepted epoch's outputs root. Press the chain icon on a leaderboard row and the site calls <code>validateOutput</code> on the application contract, so anyone can check a score without trusting this site or the node.</p>
           </div>
         </div>
 
         <div class="modal-meta">
           <div>
             <span class="label">application</span>
-            <div class="mono" id="modal-app">0xA18dC0a420aB4504e36666a65F4387574cBd80C0</div>
+            <div class="mono" id="modal-app">—</div>
           </div>
           <div>
             <span class="label">input box</span>
-            <div class="mono" id="modal-ibox">0x1b51e2992A2755Ba4D6F7094032DF91991a0Cfac</div>
+            <div class="mono" id="modal-ibox">—</div>
           </div>
           <div>
             <span class="label">network</span>

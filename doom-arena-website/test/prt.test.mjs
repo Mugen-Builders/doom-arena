@@ -661,7 +661,7 @@ test("describeStaging: countdown, elapsed, and dissent", () => {
   assert.equal(describeStaging({ staging: { isOver: false, blocksLeft: 40n, sentriesAgree: true, sentries: { total: 1 } } }).tone, "ok");
 });
 
-test("describeDispute summarises counts and names the epoch", () => {
+test("describeDispute summarises counts (the row head names the epoch)", () => {
   assert.equal(describeDispute({ disputed: false }), null);
   const d = describeDispute({
     disputed: true,
@@ -673,7 +673,7 @@ test("describeDispute summarises counts and names the epoch", () => {
     root: { standing: { label: "DISPUTE ACTIVE", tone: "bad" } },
   });
   assert.equal(d.standing.label, "DISPUTE ACTIVE");
-  assert.equal(d.meta, "epoch #7 · 2 commitments · 1/3 matches active · 2 tournaments");
+  assert.equal(d.meta, "2 commitments · 1/3 matches active · 2 tournaments");
 });
 
 test("describeDispute falls back when the node gave no standing", () => {
@@ -684,7 +684,6 @@ test("describeDispute falls back when the node gave no standing", () => {
   assert.equal(d.standing.label, "DISPUTE");
   assert.equal(d.standing.tone, "bad");
   assert.ok(!d.meta.includes("tournaments")); // single tournament -> omitted
-  assert.ok(!d.meta.includes("epoch")); // unknown epoch -> omitted
 });
 
 test("describeTree interleaves tournaments with their matches", () => {
@@ -777,7 +776,7 @@ test("end to end: fetchPrtState output feeds the view helpers", async () => {
   assert.deepEqual(rows.map((r) => r.kind), ["tournament", "match", "tournament", "note"]);
   assert.equal(rows[1].label, "decided by inner tournament");
   assert.match(rows[3].label, /as of block 990/);
-  assert.equal(describeDispute(prt).meta, "epoch #7 · 2 commitments · 0/1 matches active · 2 tournaments");
+  assert.equal(describeDispute(prt).meta, "2 commitments · 0/1 matches active · 2 tournaments");
   assert.equal(describeStaging(prt), null);
 });
 
@@ -797,4 +796,370 @@ test("tree labels stay ASCII-safe (no emoji tofu in the mono stack)", () => {
     !/[\u{1F000}-\u{1FAFF}\u{2190}-\u{2BFF}\u{FE0F}]/u.test(text),
     `label contains a glyph the mono stack may not have: ${text}`,
   );
+});
+
+// -------------------------------------------------------------
+// 7. consensus state read from the contracts
+// -------------------------------------------------------------
+import {
+  tournamentAbi,
+  TOURNAMENT_STANDING_INDEX,
+  standingFromIndex,
+  fetchConsensusState,
+  consensusPhase,
+  isLivePhase,
+  deriveLastAccepted,
+  describeSettling,
+  inputsOf,
+} from "../src/prt.js";
+
+const OFFICIAL_V5_TOURNAMENT = {
+  tournamentStanding:
+    "tournamentStanding() view returns ((uint8,bool,bool,bytes32,bytes32,bytes32,uint64,uint64))",
+  getCommitmentJoinedCount: "getCommitmentJoinedCount() view returns (uint256)",
+  getMatchCreatedCount: "getMatchCreatedCount() view returns (uint256)",
+  getMatchDeletedCount: "getMatchDeletedCount() view returns (uint256)",
+  getNewInnerTournamentCount: "getNewInnerTournamentCount() view returns (uint256)",
+};
+
+test("alpha.5 ITournament read ABI matches the official artifact", () => {
+  const got = Object.fromEntries(
+    tournamentAbi.filter((e) => e.type === "function").map((e) => [e.name, fullSig(e)]),
+  );
+  assert.deepEqual(got, OFFICIAL_V5_TOURNAMENT);
+});
+
+test("TOURNAMENT_STANDING_INDEX is the Solidity enum order and covers the node enum", () => {
+  assert.deepEqual(
+    [...TOURNAMENT_STANDING_INDEX].sort(),
+    [...ENUM("TournamentStandingState")].sort(),
+  );
+  assert.equal(TOURNAMENT_STANDING_INDEX[0], "MATCHES_ACTIVE");
+  assert.equal(TOURNAMENT_STANDING_INDEX[3], "ROOT_FAILED");
+  assert.equal(standingFromIndex(3n).key, "ROOT_FAILED");
+  assert.equal(standingFromIndex(3).tone, "bad");
+  assert.equal(standingFromIndex(99).label, "UNKNOWN");
+  assert.equal(standingFromIndex(null), null);
+});
+
+const CONS = "0xDACE";
+const TADDR = "0xAA";
+const H0 = "0x" + "0".repeat(64);
+const HX = (n) => "0x" + n.toString(16).padStart(64, "0");
+const ZERO_ADDR = "0x" + "0".repeat(40);
+const sealedTuple = (epoch, t = TADDR, staged = false, stagingBlock = 0n, lo = 0n, hi = 4n) =>
+  [BigInt(epoch), lo, hi, t, staged, stagingBlock, H0, H0];
+const standingTuple = (idx, over = {}) => ({
+  standing: idx,
+  acceptsJoins: false,
+  hasCandidate: false,
+  candidate: H0,
+  finalState: H0,
+  parentCommitment: H0,
+  finishedAt: 0n,
+  winnerExpiresAt: 0n,
+  ...over,
+});
+const canStageTuple = (finished, failed) => [finished, failed, false, 0n, H0, H0];
+
+test("live Base Sepolia shape: node stuck at CLAIM_COMPUTED, tournament failed on-chain", async () => {
+  const chain = stubChain(
+    {
+      [`${CONS}|getCurrentSealedEpoch`]: sealedTuple(0, TADDR, false, 0n, 0n, 0n),
+      [`${CONS}|canStageTournamentResult`]: canStageTuple(true, true),
+      [`${TADDR}|tournamentStanding`]: standingTuple(3, { finishedAt: 47018261n }),
+      [`${TADDR}|getCommitmentJoinedCount`]: 0n,
+      [`${TADDR}|getMatchCreatedCount`]: 0n,
+      [`${TADDR}|getMatchDeletedCount`]: 0n,
+      [`${TADDR}|getNewInnerTournamentCount`]: 0n,
+    },
+    47600984n,
+  );
+  const c = await fetchConsensusState({
+    l1Client: chain,
+    consensusAddress: CONS,
+    nodeHasTournaments: false,
+  });
+  assert.equal(c.epochNumber, 0n);
+  assert.equal(c.tournament, TADDR);
+  assert.equal(c.staged, false);
+  assert.equal(c.isFinished, true);
+  assert.equal(c.isFailed, true);
+  assert.equal(c.standing.key, "ROOT_FAILED");
+  assert.equal(c.finishedAt, 47018261n);
+  assert.equal(c.joined, 0n);
+  assert.equal(c.currentBlock, 47600984n);
+  assert.equal(c.phase.key, "FAILED");
+  assert.equal(c.phase.tone, "bad");
+  // the node had no rows, so the counters were read
+  assert.ok(chain.calls.includes(`${TADDR}|getMatchCreatedCount`));
+  // not staged: no canAccept read
+  assert.ok(!chain.calls.includes(`${CONS}|canAcceptStagedTournamentResult`));
+
+  const row = describeSettling({
+    epoch: { index: 0n, status: "CLAIM_COMPUTED", inputIndexLowerBound: 0n, inputIndexUpperBound: 0n },
+    consensus: c,
+  });
+  assert.equal(row.source, "chain");
+  assert.equal(row.label, "TOURNAMENT FAILED");
+  assert.equal(row.tone, "bad");
+  assert.equal(row.epochIndex, 0n);
+  assert.equal(row.inputs, 0);
+  assert.match(row.detail, /cannot settle/);
+  assert.equal(row.nodeNote, "node: CLAIM COMPUTED");
+});
+
+test("counters are skipped when the node already serves tournament rows; joined is not", async () => {
+  const chain = stubChain({
+    [`${CONS}|getCurrentSealedEpoch`]: sealedTuple(1),
+    [`${CONS}|canStageTournamentResult`]: canStageTuple(false, false),
+    [`${TADDR}|tournamentStanding`]: standingTuple(1),
+    [`${TADDR}|getCommitmentJoinedCount`]: 1n,
+  });
+  const c = await fetchConsensusState({ l1Client: chain, consensusAddress: CONS });
+  assert.ok(!chain.calls.some((x) => /getMatch|getNewInner/.test(x)));
+  assert.equal(c.joined, 1n);
+  assert.equal(c.matchesCreated, null);
+  assert.equal(c.phase.key, "IN_TOURNAMENT");
+  assert.equal(c.phase.detail, "1 claim · challenge window open");
+});
+
+test("consensusPhase: the ladder, in contract order", () => {
+  const b = { staged: false, isFinished: false, isFailed: false, standing: null, joined: null, canAccept: null };
+  assert.equal(consensusPhase(null), null);
+  assert.equal(consensusPhase({ ...b, staged: true }).key, "STAGED");
+  assert.equal(
+    consensusPhase({ ...b, staged: true, canAccept: [true, false, true, 0n, H0, H0] }).key,
+    "AWAITING_ACCEPTANCE",
+  );
+  // staged wins even if the tournament also reads as finished
+  assert.equal(consensusPhase({ ...b, staged: true, isFinished: true }).key, "STAGED");
+  assert.equal(consensusPhase({ ...b, isFinished: true, isFailed: true }).key, "FAILED");
+  assert.equal(consensusPhase({ ...b, isFinished: true }).key, "AWAITING_STAGING");
+  assert.equal(consensusPhase({ ...b, standing: standingOf("MATCHES_ACTIVE"), joined: 2n }).key, "DISPUTE");
+  assert.equal(consensusPhase({ ...b, standing: standingOf("AWAITING_CLOSURE"), joined: 0n }).key, "AWAITING_CLAIM");
+  assert.equal(consensusPhase({ ...b, standing: null, joined: 0 }).key, "AWAITING_CLAIM");
+  const two = consensusPhase({ ...b, standing: standingOf("AWAITING_CLOSURE"), joined: 2n });
+  assert.equal(two.key, "IN_TOURNAMENT");
+  assert.equal(two.detail, "2 claims · challenge window open");
+  assert.equal(consensusPhase({ ...b, standing: standingOf("AWAITING_CLOSURE") }).detail, "challenge window open");
+  assert.equal(consensusPhase({ ...b }).key, "SEALED");
+  for (const p of Object.values({ a: consensusPhase({ ...b }), f: consensusPhase({ ...b, isFinished: true, isFailed: true }) }))
+    assert.match(css, new RegExp(`\\.status-${p.tone}\\s*\\{`));
+  assert.ok(isLivePhase({ key: "DISPUTE" }));
+  assert.ok(isLivePhase({ key: "STAGED" }));
+  assert.ok(!isLivePhase({ key: "IN_TOURNAMENT" }));
+  assert.ok(!isLivePhase(null));
+});
+
+test("fetchConsensusState: no client, no address, or a failing primary read → null", async () => {
+  assert.equal(await fetchConsensusState({ l1Client: null, consensusAddress: CONS }), null);
+  assert.equal(await fetchConsensusState({ l1Client: stubChain(), consensusAddress: null }), null);
+  assert.equal(await fetchConsensusState({ l1Client: stubChain({}, 1000n), consensusAddress: CONS }), null);
+});
+
+test("fetchConsensusState: zero tournament and partial failures degrade rather than throw", async () => {
+  const chain = stubChain(
+    {
+      [`${CONS}|getCurrentSealedEpoch`]: sealedTuple(2, ZERO_ADDR),
+      [`${CONS}|canStageTournamentResult`]: new Error("boom"),
+    },
+    new Error("rpc down"),
+  );
+  const c = await fetchConsensusState({ l1Client: chain, consensusAddress: CONS });
+  assert.equal(c.tournament, null);
+  assert.equal(c.isFinished, null);
+  assert.equal(c.standing, null);
+  assert.equal(c.currentBlock, null);
+  assert.equal(c.phase.key, "SEALED");
+  assert.ok(!chain.calls.some((x) => x.startsWith(`${ZERO_ADDR}|`)));
+});
+
+test("staged: canAccept is read by fetchConsensusState and reused, staging block from the contract", async () => {
+  const chain = stubChain(
+    {
+      [`${CONS}|getCurrentSealedEpoch`]: sealedTuple(7, TADDR, true, 950n),
+      [`${CONS}|canStageTournamentResult`]: canStageTuple(true, false),
+      [`${CONS}|canAcceptStagedTournamentResult`]: [true, false, false, 7n, HX(0xaa), HX(0xbb)],
+      [`${CONS}|getNumberOfSentries`]: 0n,
+      [`${TADDR}|tournamentStanding`]: standingTuple(2),
+      [`${TADDR}|getCommitmentJoinedCount`]: 1n,
+    },
+    1000n,
+  );
+  const c = await fetchConsensusState({ l1Client: chain, consensusAddress: CONS });
+  assert.equal(c.phase.key, "STAGED");
+  assert.equal(c.stagingBlockNumber, 950n);
+  const out = await fetchPrtState({
+    ...base,
+    nodeClient: stubNode({ tournaments: [T(TADDR, 0, null, tSnap("ROOT_WINNER"))] }),
+    l1Client: chain,
+    // the node still says CLAIM_COMPUTED and has no staged_at_block
+    epoch: { index: 7n, status: "CLAIM_COMPUTED", tournamentAddress: TADDR },
+    claimStagingPeriod: 100n,
+    consensus: c,
+  });
+  assert.equal(chain.calls.filter((x) => x.endsWith("canAcceptStagedTournamentResult")).length, 1);
+  assert.ok(out.staging);
+  assert.equal(out.staging.blocksLeft, 50n);
+  assert.equal(out.currentBlock, 1000n);
+  assert.match(describeStaging(out).text, /^accepts in 50/);
+  const row = describeSettling({ epoch: { index: 7n, status: "CLAIM_COMPUTED" }, consensus: c, prt: out });
+  assert.equal(row.label, "STAGED");
+  assert.equal(row.nodeNote, "node: CLAIM COMPUTED");
+});
+
+test("contract says not staged: the node's STAGED label does not trigger consensus reads", async () => {
+  const chain = stubChain({}, 1000n);
+  const c = { epochNumber: 7n, tournament: TADDR, staged: false, isFinished: false, isFailed: false, standing: null, joined: 1n, canAccept: null, currentBlock: 1000n };
+  const out = await fetchPrtState({
+    ...base,
+    nodeClient: stubNode(),
+    l1Client: chain,
+    epoch: { index: 7n, status: "CLAIM_STAGED", stagedAtBlock: 950n, tournamentAddress: TADDR },
+    claimStagingPeriod: 100n,
+    consensus: c,
+  });
+  assert.equal(out.staging, null);
+  assert.equal(chain.calls.length, 0);
+});
+
+const chainOnly = (over = {}) => ({
+  epochNumber: 0n,
+  inputIndexLowerBound: 0n,
+  inputIndexUpperBound: 0n,
+  tournament: TADDR,
+  staged: false,
+  isFinished: true,
+  isFailed: true,
+  standing: standingOf("ROOT_FAILED"),
+  joined: 0n,
+  matchesCreated: 0n,
+  matchesDeleted: 0n,
+  innerTournaments: 0n,
+  canAccept: null,
+  currentBlock: 1000n,
+  ...over,
+});
+
+test("node has no tournament rows: the root comes from the chain and the tree says so", async () => {
+  const c = chainOnly();
+  c.phase = consensusPhase(c);
+  const out = await fetchPrtState({
+    ...base,
+    nodeClient: stubNode(),
+    l1Client: stubChain(),
+    epoch: { index: 0n, status: "CLAIM_COMPUTED" },
+    consensus: c,
+  });
+  assert.equal(out.root.address, TADDR);
+  assert.equal(out.root.fromChain, true);
+  assert.equal(out.root.standing.key, "ROOT_FAILED");
+  assert.equal(out.order.length, 1);
+  assert.deepEqual(out.chainCounts, { joined: 0, matchesCreated: 0, matchesDeleted: 0, innerTournaments: 0 });
+  assert.equal(out.disputed, false);
+  assert.equal(out.currentBlock, 1000n);
+  const rows = describeTree(out);
+  assert.equal(rows[0].kind, "tournament");
+  assert.equal(rows[0].label, "root");
+  assert.equal(rows[0].standing.label, "FAILED — NO WINNER");
+  assert.ok(rows.some((r) => r.kind === "note" && /node has not indexed this tournament/.test(r.label)));
+});
+
+test("chain counters flag a dispute the node never indexed", async () => {
+  const c = chainOnly({
+    isFinished: false,
+    isFailed: false,
+    standing: standingOf("MATCHES_ACTIVE"),
+    joined: 2n,
+    matchesCreated: 1n,
+  });
+  c.phase = consensusPhase(c);
+  const out = await fetchPrtState({
+    ...base,
+    nodeClient: stubNode(),
+    l1Client: stubChain(),
+    epoch: { index: 0n, status: "CLAIM_SUBMITTED" },
+    consensus: c,
+  });
+  assert.equal(out.disputed, true);
+  const d = describeDispute(out);
+  assert.equal(d.standing.label, "DISPUTE ACTIVE");
+  assert.equal(d.meta, "2 commitments · 1/1 matches active · from chain");
+  const row = describeSettling({ epoch: { index: 0n, status: "CLAIM_SUBMITTED" }, consensus: c, prt: out });
+  assert.equal(row.label, "DISPUTE ACTIVE");
+  assert.equal(row.detail, null); // the dispute line below carries the counts
+  assert.equal(row.nodeNote, "node: IN TOURNAMENT");
+});
+
+test("node rows present: node standing stays, chain fills a missing one, no chain counts", async () => {
+  const c = chainOnly({ isFinished: false, isFailed: false, standing: standingOf("AWAITING_CLOSURE"), joined: 1n, epochNumber: 7n });
+  const noSnap = await fetchPrtState({
+    ...base,
+    nodeClient: stubNode({ tournaments: [T(TADDR, 0)] }),
+    l1Client: stubChain(),
+    consensus: c,
+  });
+  assert.equal(noSnap.root.standing.key, "AWAITING_CLOSURE");
+  assert.equal(noSnap.chainCounts, null);
+  const withSnap = await fetchPrtState({
+    ...base,
+    nodeClient: stubNode({ tournaments: [T(TADDR, 0, null, tSnap("ROOT_WINNER"))] }),
+    l1Client: stubChain(),
+    consensus: c,
+  });
+  assert.equal(withSnap.root.standing.key, "ROOT_WINNER");
+});
+
+test("epoch missing on the node but sealed on chain still renders", async () => {
+  const c = chainOnly({ epochNumber: 3n, inputIndexLowerBound: 2n, inputIndexUpperBound: 5n, isFinished: false, isFailed: false, standing: standingOf("AWAITING_CLOSURE") });
+  c.phase = consensusPhase(c);
+  const out = await fetchPrtState({ ...base, nodeClient: stubNode(), l1Client: stubChain(), epoch: null, consensus: c });
+  assert.equal(out.epochIndex, 3n);
+  const row = describeSettling({ epoch: null, consensus: c, prt: out });
+  assert.equal(row.label, "AWAITING CLAIM");
+  assert.equal(row.epochIndex, 3n);
+  assert.equal(row.inputs, 3);
+  assert.equal(row.nodeNote, "node has no epoch #3 yet");
+});
+
+test("describeSettling without chain state is just the node's status", () => {
+  assert.equal(describeSettling({}), null);
+  assert.equal(describeSettling({ epoch: null, consensus: null }), null);
+  const row = describeSettling({
+    epoch: { index: 4n, status: "CLAIM_SUBMITTED", inputIndexLowerBound: 10n, inputIndexUpperBound: 12n },
+  });
+  assert.equal(row.source, "node");
+  assert.equal(row.label, "IN TOURNAMENT");
+  assert.equal(row.tone, "pending");
+  assert.equal(row.epochIndex, 4n);
+  assert.equal(row.inputs, 2);
+  assert.equal(row.nodeNote, null);
+});
+
+test("describeSettling: matching labels need no note; another epoch on the node is named", () => {
+  const c = chainOnly({ epochNumber: 2n, isFinished: false, isFailed: false, standing: standingOf("AWAITING_CLOSURE"), joined: 1n });
+  const same = describeSettling({ epoch: { index: 2n, status: "CLAIM_SUBMITTED" }, consensus: c });
+  assert.equal(same.label, "IN TOURNAMENT");
+  assert.equal(same.nodeNote, null);
+  const other = describeSettling({ epoch: { index: 1n, status: "CLAIM_STAGED" }, consensus: c });
+  assert.equal(other.epochIndex, 2n);
+  assert.equal(other.nodeNote, "node is on epoch #1 · STAGED");
+});
+
+test("deriveLastAccepted: the newer of the node's index and the contract's implied one", () => {
+  assert.equal(deriveLastAccepted(null, null), null);
+  assert.equal(deriveLastAccepted(null, { epochNumber: 0n }), null);
+  assert.equal(deriveLastAccepted(null, { epochNumber: 3n }), 2n);
+  assert.equal(deriveLastAccepted(4n, { epochNumber: 3n }), 4n);
+  assert.equal(deriveLastAccepted(1n, { epochNumber: 5n }), 4n);
+  assert.equal(deriveLastAccepted(1n, null), 1n);
+  assert.equal(deriveLastAccepted(0n, { epochNumber: 1n }), 0n);
+});
+
+test("inputsOf: index bounds to a count, else null", () => {
+  assert.equal(inputsOf({ inputIndexLowerBound: 0n, inputIndexUpperBound: 4n }), 4);
+  assert.equal(inputsOf({ inputIndexLowerBound: 3, inputIndexUpperBound: 3 }), 0);
+  assert.equal(inputsOf({ inputIndexLowerBound: 1n }), null);
+  assert.equal(inputsOf(null), null);
 });

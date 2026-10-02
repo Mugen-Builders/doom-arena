@@ -237,6 +237,26 @@ const page = (rows, total = rows.length) => ({
   pagination: { total_count: total, limit: rows.length, offset: 0 },
 });
 
+// eth_call answers, keyed by selector (the fake L1 ignores `to`).
+const enc = (types, values) => encodeAbiParameters(parseAbiParameters(types), values);
+const l1Sealed = (epochIdx, tournament, staged = false, stagingBlock = 0, lo = 0, hi = 2) => [
+  toFunctionSelector("getCurrentSealedEpoch()"),
+  enc("uint256,uint256,uint256,address,bool,uint256,bytes32,bytes32", [
+    BigInt(epochIdx), BigInt(lo), BigInt(hi), getAddress(tournament), staged, BigInt(stagingBlock), H(0), H(0),
+  ]),
+];
+const l1CanStage = (finished, failed) => [
+  toFunctionSelector("canStageTournamentResult()"),
+  enc("bool,bool,bool,uint256,bytes32,bytes32", [finished, failed, false, 0n, H(0), H(0)]),
+];
+// TournamentStanding enum index: 0 MATCHES_ACTIVE, 1 AWAITING_CLOSURE, 2 ROOT_WINNER, 3 ROOT_FAILED
+const l1Standing = (idx, finishedAt = 0) => [
+  toFunctionSelector("tournamentStanding()"),
+  enc("(uint8,bool,bool,bytes32,bytes32,bytes32,uint64,uint64)", [[idx, false, false, H(0), H(0), H(0), BigInt(finishedAt), 0n]]),
+];
+const l1Uint = (sig, n) => [toFunctionSelector(sig), enc("uint256", [BigInt(n)])];
+const chain = (...pairs) => Object.fromEntries(pairs);
+
 // -------------------------------------------------------------
 // scenarios: method -> result | { error } | (params) => ...
 // -------------------------------------------------------------
@@ -251,6 +271,7 @@ const SCENARIOS = {
   // PRT, epoch 1 sealed and disputed, epoch 2 open. Expect: PRT pill, settling
   // row, dispute row naming epoch #1, seven leaderboard rows, no note.
   dispute: {
+    hash: "#how", // open the How-it-works modal so its steps are in the DOM text
     cartesi_getNodeInfo: nodeInfo,
     cartesi_getApplication: { data: application() },
     cartesi_getLastAcceptedEpochIndex: { data: hex(0) },
@@ -268,16 +289,30 @@ const SCENARIOS = {
       commitment(T_ROOT, H(22), true, 1200),
     ]),
     cartesi_listMatches: page([match(T_ROOT, H(51), H(21), H(22))]),
+    cartesi_getEpoch: (p) => ({ data: epoch(Number(p.epoch_index), Number(p.epoch_index) === 1 ? "CLAIM_SUBMITTED" : "CLAIM_ACCEPTED") }),
+    l1: chain(
+      l1Sealed(1, T_ROOT, false, 0, 1, 3),
+      l1CanStage(false, false),
+      l1Standing(0),
+      l1Uint("getCommitmentJoinedCount()", 2),
+    ),
     expect: [
       "PRT",
-      "settling epoch #1",
-      "IN TOURNAMENT",
-      "epoch #1 · 2 commitments · 1/1 matches active · 2 tournaments",
+      // settling row: contract phase first, the node's label as a note
       "DISPUTE ACTIVE",
-      "7 runs",
+      "epoch #1",
+      "node: IN TOURNAMENT",
+      "2 commitments · 1/1 matches active · 2 tournaments",
+      // open and accepted rows
       "epoch #2",
+      "ACCEPTED",
+      "epoch #0",
+      "2 inputs",
+      "7 runs",
+      "STEP 05",
+      "Verify the score onchain",
     ],
-    forbid: ["config mismatch", "unsupported node", "live unreachable", "no runs yet"],
+    forbid: ["config mismatch", "unsupported node", "live unreachable", "no runs yet", "settling epoch", "last accepted epoch"],
   },
 
   // PRT, claim staged at block 950 with a 100-block staging period; the chain
@@ -294,6 +329,7 @@ const SCENARIOS = {
     cartesi_listTournaments: page([tournament(T_ROOT, 0, null, "ROOT_WINNER")]),
     cartesi_listCommitments: page([commitment(T_ROOT, H(21), false, 0)]),
     cartesi_listMatches: page([]),
+    cartesi_getEpoch: (p) => ({ data: epoch(Number(p.epoch_index), "CLAIM_ACCEPTED") }),
     l1: {
       // canAcceptStagedTournamentResult(): staged, no sentries (fast path false), period not over
       [toFunctionSelector("canAcceptStagedTournamentResult()")]: encodeAbiParameters(
@@ -301,9 +337,53 @@ const SCENARIOS = {
         [true, false, false, 1n, H(1), H(2)],
       ),
       [toFunctionSelector("getNumberOfSentries()")]: encodeAbiParameters(parseAbiParameters("uint256"), [0n]),
+      ...chain(l1Sealed(1, T_ROOT, true, 950), l1CanStage(true, false), l1Standing(2), l1Uint("getCommitmentJoinedCount()", 1)),
     },
-    expect: ["STAGED", "settling epoch #1", "accepts in 50\u00a0blk"],
-    forbid: ["DISPUTE", "config mismatch", "live unreachable"],
+    expect: ["STAGED", "epoch #1", "accepts in 50\u00a0blk", "epoch #2"],
+    forbid: ["DISPUTE", "config mismatch", "live unreachable", "node:", "settling epoch"],
+  },
+
+  // Mirrors the live Base Sepolia deployment on 2026-10-02: the node computed
+  // epoch 0's claim and never submitted it (CLAIM_COMPUTED, no tournament
+  // rows, no accepted epoch), while on-chain the tournament ran out its
+  // allowance with zero commitments and reads ROOT_FAILED. The panel must say
+  // what the chain says and keep the node's label as a note.
+  stalenode: {
+    cartesi_getNodeInfo: nodeInfo,
+    cartesi_getApplication: { data: application() },
+    cartesi_getLastAcceptedEpochIndex: { error: { code: -31001, message: "Epoch not found" } },
+    cartesi_listEpochs: (p) =>
+      p.status
+        ? page([epoch(0, "CLAIM_COMPUTED", { input_index_lower_bound: hex(0), input_index_upper_bound: hex(0) })])
+        : page([epoch(1, "OPEN", { input_index_lower_bound: hex(0), input_index_upper_bound: hex(4) })], 2),
+    cartesi_getEpoch: (p) => ({ data: epoch(Number(p.epoch_index), Number(p.epoch_index) === 0 ? "CLAIM_COMPUTED" : "OPEN") }),
+    cartesi_listOutputs: listOutputs,
+    cartesi_listTournaments: page([]),
+    cartesi_listCommitments: page([]),
+    cartesi_listMatches: page([]),
+    l1: chain(
+      l1Sealed(0, T_ROOT, false, 0, 0, 0),
+      l1CanStage(true, true),
+      l1Standing(3, 900),
+      l1Uint("getCommitmentJoinedCount()", 0),
+      l1Uint("getMatchCreatedCount()", 0),
+      l1Uint("getMatchDeletedCount()", 0),
+      l1Uint("getNewInnerTournamentCount()", 0),
+    ),
+    expect: [
+      "PRT",
+      "OPEN",
+      "epoch #1",
+      "4 inputs",
+      "TOURNAMENT FAILED",
+      "epoch #0",
+      "0 inputs",
+      "no claim within allowance",
+      "node: CLAIM COMPUTED",
+      "no accepted epoch yet",
+      "7 runs",
+    ],
+    forbid: ["0xA18d", "settling epoch", "last accepted epoch", "live unreachable", "config mismatch", "DISPUTE"],
   },
 
   // Authority, nothing disputed, no accepted epoch yet (-31001 is not an error).
@@ -313,8 +393,8 @@ const SCENARIOS = {
     cartesi_getLastAcceptedEpochIndex: { error: { code: -31001, message: "epoch not found" } },
     cartesi_listEpochs: (p) => (p.status ? page([]) : page([epoch(0, "OPEN")])),
     cartesi_listOutputs: () => page([]),
-    expect: ["AUTHORITY", "no runs yet", "epoch #0"],
-    forbid: ["live unreachable", "settling epoch", "config mismatch"],
+    expect: ["AUTHORITY", "no runs yet", "epoch #0", "no accepted epoch yet"],
+    forbid: ["live unreachable", "settling epoch", "config mismatch", "TOURNAMENT", "node:"],
   },
 
   // Same node, but the site was built for another InputBox.
@@ -333,7 +413,7 @@ const SCENARIOS = {
     cartesi_getNodeVersion: { data: "2.0.0-alpha.12" },
     cartesi_getApplication: { data: application() },
     cartesi_listOutputs: listOutputs,
-    expect: ["unsupported node", "next/2.0", "live unreachable"],
+    expect: ["unsupported node", "next/2.0", "7 runs"],
     forbid: ["config mismatch"],
   },
 
@@ -571,7 +651,7 @@ for (const key of keys) {
   await listen(l1, Number(L1_URL.port), hostFor(L1_URL));
   let result;
   try {
-    result = await render(chrome, `${SITE_ORIGIN}/`);
+    result = await render(chrome, `${SITE_ORIGIN}/${scenario.hash ?? ""}`);
   } finally {
     await new Promise((r) => server.close(r));
     await new Promise((r) => l1.close(r));

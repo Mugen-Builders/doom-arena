@@ -13,7 +13,15 @@ import {
   isNotFound,
   isUnsupportedNode,
 } from "../src/nodeRpc.js";
-import { fetchPrtState, epochStatus, isSettled, NON_TERMINAL_PAST_OPEN } from "../src/prt.js";
+import {
+  fetchPrtState,
+  epochStatus,
+  isSettled,
+  NON_TERMINAL_PAST_OPEN,
+  fetchConsensusState,
+  describeSettling,
+  deriveLastAccepted,
+} from "../src/prt.js";
 
 const NODE_URL = process.argv[2] ?? "http://localhost:10011";
 const APP = process.argv[3] ?? "doom_arena";
@@ -121,6 +129,46 @@ if (prt.tournaments.length) {
   check(prt.root?.standing != null, "root tournament standing comes from the snapshot", prt.root?.standing?.key);
 }
 if (!isPrt) check(prt.disputed === false && prt.tournaments.length === 0, "non-PRT deployment reports no dispute and no tournaments");
+
+// ---- consensus contract (PRT) ----------------------------------------------
+// The sealed epoch's state as the chain sees it; this is what the settling row
+// shows, with the node's label demoted to a note when they disagree.
+if (isPrt) {
+  const consensus = await fetchConsensusState({
+    l1Client: l1,
+    consensusAddress: app.consensusAddress,
+    nodeHasTournaments: prt.tournaments.length > 0,
+  });
+  check(consensus != null, "fetchConsensusState read the sealed epoch from the consensus contract");
+  if (consensus) {
+    console.log(
+      `  sealed epoch=#${consensus.epochNumber} inputs=${consensus.inputIndexLowerBound}..${consensus.inputIndexUpperBound} tournament=${consensus.tournament} staged=${consensus.staged} finished=${consensus.isFinished} failed=${consensus.isFailed} standing=${consensus.standing?.key} joined=${consensus.joined} block=${consensus.currentBlock}`,
+    );
+    check(consensus.phase != null, "sealed epoch has a contract phase", consensus.phase?.key);
+    const nodeSettling = settling.data[0] ?? null;
+    const sealedOnNode =
+      nodeSettling && BigInt(nodeSettling.index) === BigInt(consensus.epochNumber)
+        ? nodeSettling
+        : await node.getEpoch({ application: APP, epochIndex: consensus.epochNumber }).catch(() => null);
+    const withChain = await fetchPrtState({
+      nodeClient: node,
+      l1Client: l1,
+      application: APP,
+      consensusAddress: app.consensusAddress,
+      epoch: sealedOnNode,
+      claimStagingPeriod: app.claimStagingPeriod,
+      consensus,
+    });
+    const row = describeSettling({ epoch: sealedOnNode, consensus, prt: withChain });
+    check(row != null && row.source === "chain", "settling row is driven by the chain", `${row?.label} · epoch #${row?.epochIndex}`);
+    console.log(`  settling row: ${row.label} (${row.tone}) epoch #${row.epochIndex} · ${row.inputs} inputs · ${row.detail ?? ""}${row.nodeNote ? ` · [${row.nodeNote}]` : ""}`);
+    if (withChain.chainCounts)
+      console.log(`  node has no tournament rows; chain counters: ${JSON.stringify(withChain.chainCounts)}`);
+    if (withChain.root) check(withChain.root.standing != null, "root tournament standing known (node snapshot or chain)", withChain.root.standing?.key);
+    const last = deriveLastAccepted(lastAccepted, consensus);
+    console.log(`  last accepted: node=${lastAccepted} derived=${last}`);
+  }
+}
 
 console.log(`\n${failures === 0 ? "ALL CHECKS PASSED" : failures + " CHECK(S) FAILED"}`);
 process.exit(failures === 0 ? 0 : 1);

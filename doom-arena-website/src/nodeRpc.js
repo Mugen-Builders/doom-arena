@@ -557,6 +557,12 @@ export const calls = {
     map: single(toInput),
   }),
 
+  getEpoch: ({ application, epochIndex }) => ({
+    method: "cartesi_getEpoch",
+    params: { application, epoch_index: hexParam(epochIndex) },
+    map: single(toEpoch),
+  }),
+
   listTournaments: (p) => ({
     method: "cartesi_listTournaments",
     params: clean({

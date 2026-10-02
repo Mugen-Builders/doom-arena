@@ -92,3 +92,40 @@ export function submitErrorMessage(err, chainName = "this chain") {
     return `gas limit above ${chainName} cap (${MAX_TX_GAS.toLocaleString("en-US")})`;
   return err?.details || err?.shortMessage || firstLine(err?.message) || String(err);
 }
+
+// -------------------------------------------------------------
+// Pending-run state machine
+// -------------------------------------------------------------
+// The run waiting to go on-chain. A recording that finishes becomes the
+// pending run; a failed submit keeps it so the player can retry; any replay
+// wipes it, so a tape fetched from the leaderboard can never be submitted.
+//
+//   state: null | { payload, status: "idle"|"submitting"|"ok"|"failed", error, txHash }
+
+export function runReducer(state, event) {
+  switch (event?.type) {
+    case "finished":
+      // A replay finishing emits the same rivemuOnFinish; it is not ours.
+      return event.replaying || !event.payload
+        ? null
+        : { payload: event.payload, status: "idle", error: null, txHash: null };
+    case "submit":
+      return state ? { ...state, status: "submitting", error: null } : null;
+    case "ok":
+      return state
+        ? { ...state, status: "ok", txHash: event.txHash ?? null, error: null }
+        : null;
+    case "failed":
+      return state
+        ? { ...state, status: "failed", error: event.error ?? "unknown error" }
+        : null;
+    case "reject": // not submittable at all (bad or oversized payload)
+    case "replay":
+    case "exit-replay":
+      return null;
+    default:
+      return state;
+  }
+}
+
+export const canRetry = (state) => state?.status === "failed";

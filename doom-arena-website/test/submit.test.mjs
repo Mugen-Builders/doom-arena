@@ -127,3 +127,69 @@ test("submitErrorMessage falls back to the first line / shortMessage", () => {
   assert.equal(submitErrorMessage(new Error("config mismatch — node is on chain 84532")), "config mismatch — node is on chain 84532");
   assert.equal(submitErrorMessage("plain string"), "plain string");
 });
+
+// -------------------------------------------------------------
+// pending-run state machine
+// -------------------------------------------------------------
+import { runReducer, canRetry } from "../src/submit.js";
+
+const P = "0x" + "ab".repeat(40);
+
+test("a finished recording becomes the pending run", () => {
+  const s = runReducer(null, { type: "finished", payload: P, replaying: false });
+  assert.deepEqual(s, { payload: P, status: "idle", error: null, txHash: null });
+  assert.equal(canRetry(s), false);
+});
+
+test("a replay finishing never becomes submittable", () => {
+  assert.equal(runReducer(null, { type: "finished", payload: P, replaying: true }), null);
+  // ...even when a failed run was pending: the replay's finish must not revive it
+  const failed = runReducer(
+    runReducer(runReducer(null, { type: "finished", payload: P }), { type: "submit" }),
+    { type: "failed", error: "no gas" },
+  );
+  assert.equal(runReducer(failed, { type: "finished", payload: "0x11", replaying: true }), null);
+});
+
+test("failed submit keeps the payload and allows retry; success does not", () => {
+  let s = runReducer(null, { type: "finished", payload: P });
+  s = runReducer(s, { type: "submit" });
+  assert.equal(s.status, "submitting");
+  assert.equal(canRetry(s), false);
+  s = runReducer(s, { type: "failed", error: "wallet has no ETH" });
+  assert.equal(s.status, "failed");
+  assert.equal(s.payload, P);
+  assert.equal(s.error, "wallet has no ETH");
+  assert.equal(canRetry(s), true);
+  s = runReducer(s, { type: "submit" });
+  s = runReducer(s, { type: "ok", txHash: "0xdead" });
+  assert.equal(s.status, "ok");
+  assert.equal(s.txHash, "0xdead");
+  assert.equal(canRetry(s), false);
+});
+
+test("starting or leaving a replay wipes whatever was pending", () => {
+  let s = runReducer(null, { type: "finished", payload: P });
+  s = runReducer(s, { type: "submit" });
+  s = runReducer(s, { type: "failed", error: "x" });
+  assert.equal(runReducer(s, { type: "replay" }), null);
+  assert.equal(runReducer(s, { type: "exit-replay" }), null);
+  assert.equal(runReducer(s, { type: "reject" }), null);
+});
+
+test("submit/ok/failed without a pending run stay null; unknown events are no-ops", () => {
+  assert.equal(runReducer(null, { type: "submit" }), null);
+  assert.equal(runReducer(null, { type: "ok", txHash: "0x1" }), null);
+  assert.equal(runReducer(null, { type: "failed", error: "x" }), null);
+  const s = runReducer(null, { type: "finished", payload: P });
+  assert.equal(runReducer(s, { type: "whatever" }), s);
+  assert.equal(runReducer(s, undefined), s);
+});
+
+test("a new recording replaces a failed one", () => {
+  let s = runReducer(null, { type: "finished", payload: P });
+  s = runReducer(runReducer(s, { type: "submit" }), { type: "failed", error: "x" });
+  const n = runReducer(s, { type: "finished", payload: "0x22", replaying: false });
+  assert.equal(n.payload, "0x22");
+  assert.equal(n.status, "idle");
+});
