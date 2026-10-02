@@ -41,7 +41,9 @@ export const INPUT_BOX_ADDRESS = "0x1b51e2992A2755Ba4D6F7094032DF91991a0Cfac";
 export const APPLICATION_NAME = "";
 // export const APPLICATION_NAME = "doom_arena"; // cartesi cloud infra
 
-// L1 JSON-RPC endpoint for contract reads (PRT tournament state, validateOutput).
+// L1 JSON-RPC endpoint for contract reads (PRT tournament state, validateOutput)
+// and for the submit path's simulate + gas estimate (see src/submit.js), so on
+// Base Sepolia set it rather than relying on the wallet's RPC.
 // Leave empty to use the chain's default public RPC — fine for anvil, but Base
 // Sepolia's default will rate-limit once tournament reads are polling.
 // This is baked into the published bundle, so use a domain-restricted or

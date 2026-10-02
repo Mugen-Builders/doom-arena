@@ -28,6 +28,7 @@ import {
   toBytes,
   fromHex,
 } from "viem"; // "https://esm.sh/viem@2.50.4"; //"viem";
+import { checkPayloadSize, gasForSubmit, submitErrorMessage } from "./submit";
 import { baseSepolia, anvil, sepolia, mainnet, base } from "viem/chains"; // "https://esm.sh/viem@2.50.4/chains"; //"viem/chains";
 
 import * as CFG from "./config";
@@ -258,25 +259,41 @@ async function setupWallet() {
 // =============================================================
 const inputBoxAbi = parseAbi([
   "function addInput(address _app, bytes payload) payable",
+  "error InputTooLarge(address appContract, uint256 inputLength, uint256 maxInputLength)",
 ]);
 
+// Gas is estimated here, with the real sender on our own L1 RPC, and sent
+// explicitly. Left to the wallet, a failed estimate (no ETH for gas, flaky
+// wallet RPC) makes MetaMask fall back to a fraction of the block gas limit,
+// which on Base Sepolia (1.2B) is far above the 16,777,216 per-transaction
+// cap and gets the tx rejected with "exceeds max transaction gas limit".
+// Limits and numbers: see ./submit.js.
 async function submitGameplay(payload) {
   // A stale config.js would send the run to an InputBox the node is not
   // watching; that loses the run silently. Refuse instead.
   if (LIFECYCLE_STATE.mismatch.length)
     throw new Error(`config mismatch — ${LIFECYCLE_STATE.mismatch[0]}`);
+  const size = checkPayloadSize(payload);
+  if (!size.ok) throw new Error(size.message);
   if (!WALLET_CLIENT) WALLET_CLIENT = await getWalletClient();
   if (!WALLET_CLIENT) throw new Error("wallet not connected");
 
-  const { request } = await l1Client.simulateContract({
+  const call = {
     account: WALLET_CLIENT.account,
     address: CFG.INPUT_BOX_ADDRESS,
     abi: inputBoxAbi,
     functionName: "addInput",
     args: [CFG.APPLICATION_ADDRESS, payload],
     value: 0n,
+  };
+  // simulate first: an eth_call decodes reverts (InputTooLarge) regardless
+  // of the sender's balance; estimateGas then surfaces "insufficient funds".
+  const { request } = await l1Client.simulateContract(call);
+  const estimate = await l1Client.estimateContractGas(call);
+  const txHash = await WALLET_CLIENT.writeContract({
+    ...request,
+    gas: gasForSubmit(estimate),
   });
-  const txHash = await WALLET_CLIENT.writeContract(request);
   await l1Client.waitForTransactionReceipt({ hash: txHash });
   return txHash;
 }
@@ -295,13 +312,20 @@ window.addEventListener("message", async (e) => {
         setStatus("invalid payload", "bad");
         return;
       }
+      // Too long for the InputBox: say so before the wallet ever opens.
+      const size = checkPayloadSize(gameplayPayload);
+      if (!size.ok) {
+        setStatus(size.message, "bad");
+        return;
+      }
       setStatus("submitting run…");
       const txHash = await submitGameplay(gameplayPayload);
       setStatus(`submitted ✓ tx ${txHash.slice(0, 10)}…`, "ok");
       setTimeout(fetchLeaderboard, 1500);
     } catch (err) {
       console.error("submit failed:", err);
-      setStatus(`submit failed · ${humanError(err)}`, "bad");
+      const chainName = getChain(CFG.CHAIN_ID)?.name ?? "this chain";
+      setStatus(`submit failed · ${submitErrorMessage(err, chainName)}`, "bad");
     }
   }
 });
