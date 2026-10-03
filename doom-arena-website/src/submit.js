@@ -97,27 +97,57 @@ export function submitErrorMessage(err, chainName = "this chain") {
 // Pending-run state machine
 // -------------------------------------------------------------
 // The run waiting to go on-chain. A recording that finishes becomes the
-// pending run; a failed submit keeps it so the player can retry; any replay
+// pending run; a failure BEFORE the wallet broadcast keeps it so the player
+// can re-send; a failure AFTER the broadcast keeps the tx hash so the player
+// can look the receipt up instead of sending the same run twice. Any replay
 // wipes it, so a tape fetched from the leaderboard can never be submitted.
 //
-//   state: null | { payload, status: "idle"|"submitting"|"ok"|"failed", error, txHash }
+//   state: null | { payload, status, error, txHash }
+//   status: idle -> submitting -> sent -> ok
+//                              \-> failed        (no hash: re-send allowed)
+//                        sent -> unconfirmed     (hash known: check first)
+//                 unconfirmed -> failed via "reverted" (re-send allowed)
 
 export function runReducer(state, event) {
   switch (event?.type) {
     case "finished":
       // A replay finishing emits the same rivemuOnFinish; it is not ours.
-      return event.replaying || !event.payload
+      // The tape bytes decide, not UI state: a replay being torn down fires
+      // its finish after the replay flags are already cleared.
+      return event.replaying || event.isReplayTape || !event.payload
         ? null
         : { payload: event.payload, status: "idle", error: null, txHash: null };
     case "submit":
-      return state ? { ...state, status: "submitting", error: null } : null;
+    case "resend":
+      return state ? { ...state, status: "submitting", error: null, txHash: null } : null;
+    case "sent":
+      return state
+        ? { ...state, status: "sent", txHash: event.txHash ?? state.txHash ?? null, error: null }
+        : null;
     case "ok":
       return state
-        ? { ...state, status: "ok", txHash: event.txHash ?? null, error: null }
+        ? { ...state, status: "ok", txHash: event.txHash ?? state.txHash ?? null, error: null }
+        : null;
+    case "unconfirmed":
+      return state
+        ? {
+            ...state,
+            status: "unconfirmed",
+            txHash: event.txHash ?? state.txHash ?? null,
+            error: event.error ?? "receipt not seen yet",
+          }
         : null;
     case "failed":
+      if (!state) return null;
+      // Once a hash exists the tx may well be mined: never fall back to a
+      // state that allows a blind re-send.
+      if (state.txHash)
+        return { ...state, status: "unconfirmed", error: event.error ?? "receipt not seen yet" };
+      return { ...state, status: "failed", error: event.error ?? "unknown error", txHash: null };
+    case "reverted":
+      // The chain rejected it: the run is still good, sending again is safe.
       return state
-        ? { ...state, status: "failed", error: event.error ?? "unknown error" }
+        ? { ...state, status: "failed", error: event.error ?? "transaction reverted", txHash: null }
         : null;
     case "reject": // not submittable at all (bad or oversized payload)
     case "replay":
@@ -129,3 +159,14 @@ export function runReducer(state, event) {
 }
 
 export const canRetry = (state) => state?.status === "failed";
+export const canCheck = (state) => state?.status === "unconfirmed";
+export const isBusy = (state) => state?.status === "submitting" || state?.status === "sent";
+
+// Byte-for-byte equality of two tapes (Uint8Array or array-like); false when
+// either is missing.
+export function sameBytes(a, b) {
+  if (!a || !b || a.length == null || b.length == null) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}

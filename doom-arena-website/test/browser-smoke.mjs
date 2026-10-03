@@ -143,6 +143,31 @@ const output = (i) => ({
   updated_at: NOW,
 });
 
+// The replayed tape: what cartesi_getInput hands the replay, byte for byte.
+const REPLAY_TAPE = [1, 2, 3, 4, 5, 6, 7, 8];
+const input = (i) => ({
+  index: hex(i),
+  epoch_index: hex(0),
+  block_number: hex(100 + i),
+  raw_data: "0x",
+  decoded_data: {
+    chain_id: hex(CHAIN_ID),
+    application_contract: APP,
+    sender: PLAYER(i),
+    block_number: hex(100 + i),
+    block_timestamp: hex(1_700_000_000 + i),
+    prev_randao: "0x1",
+    index: hex(i),
+    // outhash (32 bytes) + tape
+    payload: "0x" + "ab".repeat(32) + REPLAY_TAPE.map((b) => b.toString(16).padStart(2, "0")).join(""),
+  },
+  status: "ACCEPTED",
+  transaction_hash: H(200 + i),
+  log_index: hex(0),
+  created_at: NOW,
+  updated_at: NOW,
+});
+
 const tournament = (address, level, parent, standing) => ({
   epoch_index: hex(1),
   address,
@@ -427,6 +452,43 @@ const SCENARIOS = {
   },
 };
 
+// Scenarios that drive the page from inside: a <script type="module"> is
+// injected into index.html (see staticSite) and plays the user. No wallet
+// exists in headless Chrome, so a genuine submission ends in
+// "submit failed · wallet not connected" — which is exactly how the two
+// paths are told apart.
+const driveSleep = `const sleep = (ms) => new Promise((r) => setTimeout(r, ms));`;
+const finishMsg = (outhashByte, tape) =>
+  `window.postMessage({ rivemuOnFinish: true, outhash: "${outhashByte}".repeat(32), tape: new Uint8Array([${tape.join(",")}]) }, "*");`;
+
+// Exiting a replay resets the emulator, which reports the stop as a finish
+// carrying the replayed tape. That finish must never become a submission.
+SCENARIOS.replayexit = {
+  ...SCENARIOS.dispute,
+  hash: "",
+  cartesi_getInput: (p) => ({ data: input(Number(p.input_index)) }),
+  hooks: `${driveSleep}
+    await sleep(2000);                                   // board rendered
+    document.querySelector(".col-play").click();         // loadReplay(0)
+    await sleep(1000);                                   // getInput resolved, tape remembered
+    document.getElementById("exit-replay").click();      // teardown
+    await sleep(200);
+    ${finishMsg("ab", REPLAY_TAPE)}                      // what the emulator emits on stop`,
+  expect: ["replay stopped", "7 runs"],
+  forbid: ["submitting", "submit failed", "retry submit", "wallet not connected"],
+};
+
+// Same sequence, then a finish with a different tape: a real recording, which
+// must go down the submit path (and fail here for lack of a wallet).
+SCENARIOS.newrun = {
+  ...SCENARIOS.replayexit,
+  hooks: `${SCENARIOS.replayexit.hooks}
+    await sleep(300);
+    ${finishMsg("11", [9, 9, 9])}`,
+  expect: ["submit failed · wallet not connected", "retry submit", "your run is kept"],
+  forbid: ["replay stopped", "check status", "send again anyway"],
+};
+
 // -------------------------------------------------------------
 // servers
 // -------------------------------------------------------------
@@ -495,7 +557,9 @@ function fakeL1(calls = {}, seen = []) {
   });
 }
 
-function staticSite(dir) {
+// `hooksFor()` returns the current scenario's driver script (or null); it is
+// appended to index.html as a module so it runs after main.js.
+function staticSite(dir, hooksFor = () => null) {
   const types = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".ico": "image/x-icon" };
   return http.createServer((req, res) => {
     const path = req.url === "/" ? "/index.html" : req.url.split("?")[0];
@@ -503,7 +567,13 @@ function staticSite(dir) {
     if (!existsSync(file)) return res.writeHead(404).end();
     const ext = path.slice(path.lastIndexOf("."));
     res.writeHead(200, { "content-type": types[ext] ?? "application/octet-stream" });
-    res.end(readFileSync(file));
+    let body = readFileSync(file);
+    const hooks = path === "/index.html" ? hooksFor() : null;
+    if (hooks)
+      body = Buffer.from(
+        body.toString("utf8").replace("</body>", `<script type="module">${hooks}</script></body>`),
+      );
+    res.end(body);
   });
 }
 
@@ -633,7 +703,8 @@ const only = process.argv[2];
 const keys = only ? [only] : Object.keys(SCENARIOS);
 let failures = 0;
 const siteDir = await buildSite();
-const site = await listen(staticSite(siteDir), SITE_PORT, SITE_HOST);
+let currentHooks = null;
+const site = await listen(staticSite(siteDir, () => currentHooks), SITE_PORT, SITE_HOST);
 
 for (const key of keys) {
   const scenario = SCENARIOS[key];
@@ -641,6 +712,7 @@ for (const key of keys) {
     console.error(`unknown scenario ${key}`);
     process.exit(2);
   }
+  currentHooks = scenario.hooks ?? null;
   const { server, seen } = fakeNode(scenario);
   await listen(server, Number(nodeUrl.port), hostFor(nodeUrl));
   const l1seen = [];

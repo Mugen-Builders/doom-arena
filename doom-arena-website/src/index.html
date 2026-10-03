@@ -100,6 +100,8 @@
           <!-- Shown only while a recorded run failed to submit -->
           <div class="canvas-foot-right" id="submit-controls" hidden>
             <button class="btn ghost" id="retry-submit" title="Submit the last run again">↻ retry submit</button>
+            <!-- unconfirmed tx only: explicit second broadcast -->
+            <button class="lc-link" id="resend-submit" type="button" hidden>send again anyway</button>
           </div>
         </div>
         <!-- One-line follow-up after a submission (auto-hides) -->

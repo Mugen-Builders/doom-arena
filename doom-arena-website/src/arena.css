@@ -751,33 +751,6 @@ h4 {
     }
 }
 
-.avatar {
-    width: 8px;
-    height: 8px;
-    display: inline-block;
-    background: currentColor;
-    flex-shrink: 0;
-    transform: rotate(45deg);
-}
-.avatar.c0 {
-    color: oklch(0.7 0.15 30);
-}
-.avatar.c1 {
-    color: rgb(0, 246, 255);
-}
-.avatar.c2 {
-    color: oklch(0.78 0.16 130);
-}
-.avatar.c3 {
-    color: oklch(0.7 0.18 340);
-}
-.avatar.c4 {
-    color: oklch(0.78 0.16 70);
-}
-.avatar.c5 {
-    color: oklch(0.7 0.14 280);
-}
-
 /* ============================================================
    rollup state — compact widget
    ============================================================ */

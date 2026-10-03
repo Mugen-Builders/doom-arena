@@ -35,6 +35,10 @@ import {
   submitErrorMessage,
   runReducer,
   canRetry,
+  canCheck,
+  isBusy,
+  sameBytes,
+  OUTHASH_BYTES,
 } from "./submit";
 import { baseSepolia, anvil, sepolia, mainnet, base } from "viem/chains"; // "https://esm.sh/viem@2.50.4/chains"; //"viem/chains";
 
@@ -302,29 +306,83 @@ async function submitGameplay(payload) {
   // of the sender's balance; estimateGas then surfaces "insufficient funds".
   const { request } = await l1Client.simulateContract(call);
   const estimate = await l1Client.estimateContractGas(call);
-  const txHash = await WALLET_CLIENT.writeContract({
+  // Returns as soon as the wallet broadcast the tx; the receipt is awaited
+  // separately (confirmSubmission) so a flaky RPC after the broadcast can
+  // never turn into a second identical submission.
+  return WALLET_CLIENT.writeContract({
     ...request,
     gas: gasForSubmit(estimate),
   });
-  await l1Client.waitForTransactionReceipt({ hash: txHash });
-  return txHash;
+}
+
+// Outcome of a broadcast tx: "success" | "reverted" | null (not seen within
+// the timeout). Never throws.
+const RECEIPT_TIMEOUT_MS = 120_000;
+async function confirmSubmission(txHash) {
+  try {
+    const receipt = await l1Client.waitForTransactionReceipt({
+      hash: txHash,
+      timeout: RECEIPT_TIMEOUT_MS,
+    });
+    return receipt?.status === "reverted" ? "reverted" : "success";
+  } catch (err) {
+    console.warn("receipt wait failed:", humanError(err));
+  }
+  try {
+    const receipt = await l1Client.getTransactionReceipt({ hash: txHash });
+    if (receipt) return receipt.status === "reverted" ? "reverted" : "success";
+  } catch (_) {
+    // not found (or RPC down): unknown
+  }
+  return null;
 }
 
 // The run waiting to go on-chain, driven by runReducer (./submit.js): set when
-// a recording finishes, kept through a failed submit so it can be retried,
-// wiped by any replay so a leaderboard tape is never submitted.
+// a recording finishes, kept through a failed submit so it can be retried or
+// its receipt looked up, wiped by any replay so a leaderboard tape is never
+// submitted.
 let PENDING_RUN = null;
+// Tape bytes of the replay last loaded into the emulator. Stopping a replay
+// (including exiting it, which resets the frame through a hash change) makes
+// the emulator emit rivemuOnFinish with THIS tape; the bytes are the reliable
+// way to tell that finish apart from a real recording.
+let REPLAY_TAPE = null;
+// Set while a replay is being torn down; a finish arriving then is dropped.
+// Cleared by that finish or by a timer, so a missing finish (replay already
+// over) cannot swallow the next real recording.
+let REPLAY_STOPPING = false;
+let replayStoppingTimer = null;
+const REPLAY_STOPPING_MS = 3_000;
+// Payloads broadcast this session -> tx hash. The same run is never sent
+// twice without the player explicitly asking.
+const SUBMITTED_PAYLOADS = new Map();
+
 const SUBMIT_NOTE_MS = 20_000;
 // The node needs a moment to process the input; refresh the board a few times.
 const BOARD_REFRESH_AFTER_SUBMIT_MS = [1_500, 15_000, 60_000];
 let noteTimer = null;
 
-function dispatchRun(event) {
-  PENDING_RUN = runReducer(PENDING_RUN, event);
+const shortTx = (h) => (h ? `${h.slice(0, 10)}…` : "—");
+
+function renderSubmitControls() {
   const controls = $("#submit-controls");
-  if (controls) controls.hidden = !canRetry(PENDING_RUN);
+  const btn = $("#retry-submit");
+  const again = $("#resend-submit");
+  if (!controls || !btn) return;
+  const retry = canRetry(PENDING_RUN);
+  const check = canCheck(PENDING_RUN);
+  controls.hidden = !(retry || check);
+  btn.textContent = check ? "↻ check status" : "↻ retry submit";
+  btn.title = check ? "Look the transaction up again" : "Submit the last run again";
+  if (again) again.hidden = !check;
 }
 
+function dispatchRun(event) {
+  PENDING_RUN = runReducer(PENDING_RUN, event);
+  renderSubmitControls();
+}
+
+// Good news fades; a warning stays until the next action replaces it.
 function showSubmitNote(text, tone) {
   const el = $("#submit-note");
   if (!el) return;
@@ -337,42 +395,103 @@ function showSubmitNote(text, tone) {
   el.hidden = false;
   el.textContent = text;
   el.dataset.tone = tone || "";
-  noteTimer = setTimeout(() => {
-    el.hidden = true;
-  }, SUBMIT_NOTE_MS);
+  if (tone !== "bad")
+    noteTimer = setTimeout(() => {
+      el.hidden = true;
+    }, SUBMIT_NOTE_MS);
 }
 
 const replayActive = () =>
   $("#game-frame")?.classList.contains("is-replay") || $("#replay-controls")?.hidden === false;
 
-async function submitPending() {
-  if (!PENDING_RUN || PENDING_RUN.status === "submitting") return;
+const isReplayPayload = (payload) =>
+  !!REPLAY_TAPE && sameBytes(toBytes(payload).slice(OUTHASH_BYTES), REPLAY_TAPE);
+
+// Wait for the pending run's receipt and settle the state accordingly.
+async function settlePending() {
+  const run = PENDING_RUN;
+  if (!run?.txHash) return;
+  const { txHash, payload } = run;
+  const outcome = await confirmSubmission(txHash);
+  // The state moved on (a replay, a new run) while we waited.
+  if (!PENDING_RUN || PENDING_RUN.txHash !== txHash) return;
+  if (outcome === "success") {
+    dispatchRun({ type: "ok", txHash });
+    setStatus(`submitted ✓ tx ${shortTx(txHash)}`, "ok");
+    showSubmitNote(
+      "run posted onchain · it can take a few minutes to show up on the leaderboard while the node processes it",
+      "ok",
+    );
+    for (const ms of BOARD_REFRESH_AFTER_SUBMIT_MS) setTimeout(fetchLeaderboard, ms);
+  } else if (outcome === "reverted") {
+    SUBMITTED_PAYLOADS.delete(payload);
+    dispatchRun({ type: "reverted", error: "transaction reverted" });
+    setStatus(`tx ${shortTx(txHash)} reverted onchain`, "bad");
+    showSubmitNote("the transaction reverted · your run is kept, retry sends it again", "bad");
+  } else {
+    dispatchRun({ type: "unconfirmed", txHash, error: "receipt not seen yet" });
+    setStatus(`tx ${shortTx(txHash)} sent · not confirmed yet`, "bad");
+    showSubmitNote(
+      `tx ${shortTx(txHash)} was broadcast but this RPC has not shown a receipt · check your wallet before sending again`,
+      "bad",
+    );
+  }
+}
+
+// Look an unconfirmed tx up again without touching the wallet.
+async function checkPending() {
+  if (!PENDING_RUN?.txHash || isBusy(PENDING_RUN)) return;
+  dispatchRun({ type: "sent", txHash: PENDING_RUN.txHash });
+  setStatus(`checking tx ${shortTx(PENDING_RUN.txHash)}…`);
+  showSubmitNote(null);
+  await settlePending();
+}
+
+async function submitPending({ resend = false } = {}) {
+  if (!PENDING_RUN || isBusy(PENDING_RUN)) return;
   if (replayActive()) {
     // Belt and braces: a replay started between the run finishing and now.
     dispatchRun({ type: "replay" });
     return;
   }
   const { payload } = PENDING_RUN;
-  dispatchRun({ type: "submit" });
+  if (isReplayPayload(payload)) {
+    dispatchRun({ type: "reject" });
+    setStatus("not submitting a replayed run", "bad");
+    return;
+  }
+  if (canCheck(PENDING_RUN) && !resend) return checkPending();
+  const prior = SUBMITTED_PAYLOADS.get(payload);
+  if (prior && !resend) {
+    dispatchRun({ type: "unconfirmed", txHash: prior, error: "already broadcast" });
+    setStatus(`this run was already sent · tx ${shortTx(prior)}`, "bad");
+    showSubmitNote(
+      `this run was already sent as tx ${shortTx(prior)} · check its status before sending it again`,
+      "bad",
+    );
+    return;
+  }
+
+  dispatchRun({ type: resend ? "resend" : "submit" });
   setStatus("submitting run…");
   showSubmitNote(null);
+  let txHash;
   try {
-    const txHash = await submitGameplay(payload);
-    dispatchRun({ type: "ok", txHash });
-    setStatus(`submitted ✓ tx ${txHash.slice(0, 10)}…`, "ok");
-    showSubmitNote(
-      "run posted onchain · it can take a few minutes to show up on the leaderboard while the node processes it",
-      "ok",
-    );
-    for (const ms of BOARD_REFRESH_AFTER_SUBMIT_MS) setTimeout(fetchLeaderboard, ms);
+    txHash = await submitGameplay(payload);
   } catch (err) {
+    // Nothing was broadcast: re-sending is safe.
     console.error("submit failed:", err);
     const chainName = getChain(CFG.CHAIN_ID)?.name ?? "this chain";
     const reason = submitErrorMessage(err, chainName);
     dispatchRun({ type: "failed", error: reason });
     setStatus(`submit failed · ${reason}`, "bad");
     showSubmitNote("your run is kept · sort out the wallet or network and retry", "bad");
+    return;
   }
+  SUBMITTED_PAYLOADS.set(payload, txHash);
+  dispatchRun({ type: "sent", txHash });
+  setStatus(`sent · tx ${shortTx(txHash)} · waiting for confirmation`);
+  await settlePending();
 }
 
 window.addEventListener("message", (e) => {
@@ -380,9 +499,23 @@ window.addEventListener("message", (e) => {
   if (!params || typeof params !== "object") return;
   if (!(params.rivemuOnFinish && params.outhash && params.tape)) return;
 
+  const isReplayTape = sameBytes(params.tape, REPLAY_TAPE);
+  const stopping = REPLAY_STOPPING;
+  REPLAY_STOPPING = false;
+  clearTimeout(replayStoppingTimer);
+
   const gameplayPayload = `0x${params.outhash}${toHex(params.tape).slice(2)}`;
-  dispatchRun({ type: "finished", payload: gameplayPayload, replaying: replayActive() });
-  if (!PENDING_RUN) return; // a replay finished: never submit a leaderboard tape
+  dispatchRun({
+    type: "finished",
+    payload: gameplayPayload,
+    replaying: replayActive() || stopping,
+    isReplayTape,
+  });
+  if (!PENDING_RUN) {
+    // A replay finished or was stopped: never submit a leaderboard tape.
+    if (stopping) setStatus("replay stopped");
+    return;
+  }
 
   if (!isHex(gameplayPayload)) {
     dispatchRun({ type: "reject" });
@@ -400,6 +533,7 @@ window.addEventListener("message", (e) => {
 });
 
 $("#retry-submit")?.addEventListener("click", () => submitPending());
+$("#resend-submit")?.addEventListener("click", () => submitPending({ resend: true }));
 
 // =============================================================
 // ICONS
@@ -555,7 +689,7 @@ function renderBoard() {
 
     row.innerHTML = `
       <span class="col-rank">${String(r.rank).padStart(2, "0")}</span>
-      <span class="col-player"><span class="avatar c${i % 6}"></span><span>${fmtAddrShort(r.user)}</span></span>
+      <span class="col-player"><span>${fmtAddrShort(r.user)}</span></span>
       <span class="col-score">${fmtScore(r.score)}</span>
       <button class="col-verify v-${vstate}${r.verifiable ? "" : " disabled"}"
               data-i="${i}" title="${verifyTitle}" ${r.verifiable ? "" : "disabled"}>${verifyIcon}</button>
@@ -637,7 +771,8 @@ async function loadReplay(i) {
     if (!res.decodedData?.payload) throw new Error("input has no decoded payload");
     const inputBytes = toBytes(res.decodedData.payload);
     // Strip the first 32 bytes (outhash) — what remains is the gameplay tape.
-    const tape = inputBytes.slice(32);
+    const tape = inputBytes.slice(OUTHASH_BYTES);
+    REPLAY_TAPE = tape;
 
     // Clear any pending upload listener from a previous replay
     if (__uploadListener) {
@@ -676,6 +811,13 @@ function exitReplay() {
   SELECTED_RUN_IDX = null;
   dispatchRun({ type: "exit-replay" });
   showSubmitNote(null);
+  // Resetting the frame below stops the replay, and the emulator reports
+  // that stop as a finish carrying the replayed tape. Drop it.
+  REPLAY_STOPPING = true;
+  clearTimeout(replayStoppingTimer);
+  replayStoppingTimer = setTimeout(() => {
+    REPLAY_STOPPING = false;
+  }, REPLAY_STOPPING_MS);
   frame().classList.remove("is-replay");
   $("#replay-controls").hidden = true;
   if (__uploadListener) {
