@@ -977,9 +977,6 @@ function renderLifecycle() {
       const st = epochStatus(currentEpoch);
       setEpochHead("open", st.label, st.tone, currentEpoch.index, st.tone === "open");
       $("#lc-open-inputs").textContent = fmtInputs(inputsOf(currentEpoch));
-      $("#lc-open-age").textContent = currentEpoch.updatedAt
-        ? `updated ${fmtAge(new Date(currentEpoch.updatedAt).getTime())}`
-        : "";
       openEl.hidden = false;
     } else {
       openEl.hidden = true;
