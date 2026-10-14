@@ -34,10 +34,13 @@ import {
   gasForSubmit,
   submitErrorMessage,
   runReducer,
+  canSubmit,
   canRetry,
   canCheck,
   isBusy,
   sameBytes,
+  scoreFromOutcard,
+  runOverlayModel,
   OUTHASH_BYTES,
 } from "./submit";
 import { baseSepolia, anvil, sepolia, mainnet, base } from "viem/chains"; // "https://esm.sh/viem@2.50.4/chains"; //"viem/chains";
@@ -118,7 +121,9 @@ const APP_REF = CFG.APPLICATION_NAME || CFG.APPLICATION_ADDRESS;
 
 // CFG.CHAIN_ID may be a hex string or a number.
 const CFG_CHAIN_ID =
-  typeof CFG.CHAIN_ID === "string" ? fromHex(CFG.CHAIN_ID, "number") : CFG.CHAIN_ID;
+  typeof CFG.CHAIN_ID === "string"
+    ? fromHex(CFG.CHAIN_ID, "number")
+    : CFG.CHAIN_ID;
 
 // L1 client for validateOutput / waitForTransactionReceipt / PRT contract reads.
 // batch:true collapses a refresh's eth_calls into few HTTP round trips, which
@@ -142,7 +147,9 @@ const esc = (v) =>
   String(v ?? "").replace(
     /[&<>"']/g,
     (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        c
+      ],
   );
 const fmtScore = (n) => (n == null ? "—" : Number(n).toLocaleString("en-US"));
 const fmtAge = (ts) => {
@@ -158,15 +165,26 @@ const fmtAge = (ts) => {
 
 const humanError = (e) => {
   if (e instanceof NodeRpcError) return `node: ${e.rpcMessage} (${e.code})`;
-  if (e instanceof NodeShapeError) return `node: unexpected response at ${e.field}`;
-  if (e instanceof NodeTransportError) return `node unreachable: ${e.message.split(": ").slice(1).join(": ")}`;
-  return e?.details || e?.shortMessage || e?.message?.split("\n")[0] || String(e);
+  if (e instanceof NodeShapeError)
+    return `node: unexpected response at ${e.field}`;
+  if (e instanceof NodeTransportError)
+    return `node unreachable: ${e.message.split(": ").slice(1).join(": ")}`;
+  return (
+    e?.details || e?.shortMessage || e?.message?.split("\n")[0] || String(e)
+  );
 };
 
 // =============================================================
 // EMULATOR
 // =============================================================
-function setEmulatorUrl(params = {}) {
+// The emulator only resets on a hash CHANGE: re-assigning an identical "#…"
+// src is a fragment navigation that fires no hashchange, so the game keeps
+// running. Callers that need a reset (replay, exit replay, discard, play
+// again) pass reset:true and get a nonce appended; the emulator ignores
+// unknown params. Wallet/chain refreshes do not force one — a chain event
+// must not wipe a run in progress when the URL did not really change.
+let EMULATOR_NONCE = 0;
+function setEmulatorUrl(params = {}, { reset = false } = {}) {
   const emulator = document.getElementById("emulator-iframe");
   if (!emulator) return;
   let src = `${EMULATOR_URL}/#`;
@@ -180,8 +198,27 @@ function setEmulatorUrl(params = {}) {
   if (CONSTS.BG_LIGHT != null) src += `&light=${CONSTS.BG_LIGHT}`;
   if (CONSTS.BG_ALPHA != null) src += `&alpha=${CONSTS.BG_ALPHA}`;
   if (params.extra) src += `&${params.extra}`;
+  if (reset) src += `&n=${++EMULATOR_NONCE}`;
   emulator.src = src;
   $("#game-frame").classList.add("iframe-loaded");
+}
+
+// The URL for a fresh recording: entropy is tied to the connected wallet.
+const playParams = () =>
+  CONNECTED_ADDR
+    ? { simple: true, entropy: CONNECTED_ADDR.toLowerCase() }
+    : { simple: true };
+
+// Back to the emulator's start button (discard, play again, exit replay).
+const resetEmulator = () => setEmulatorUrl(playParams(), { reset: true });
+
+// A canvas fullscreened inside the iframe hides this page's overlay. The
+// parent may end fullscreen for the whole top-level context.
+function exitFullscreen() {
+  if (!document.fullscreenElement) return;
+  try {
+    document.exitFullscreen?.()?.catch?.(() => {});
+  } catch (_) {}
 }
 
 function setStatus(text, tone) {
@@ -208,7 +245,9 @@ async function getWalletClient() {
         params: [{ chainId: toHex(CFG_CHAIN_ID) }],
       });
     } catch (_) {
-      throw new Error(`Wrong network — switch to ${getChain(CFG_CHAIN_ID)?.name ?? CFG_CHAIN_ID}`);
+      throw new Error(
+        `Wrong network — switch to ${getChain(CFG_CHAIN_ID)?.name ?? CFG_CHAIN_ID}`,
+      );
     }
   }
   const [address] = await window.ethereum.request({
@@ -250,13 +289,13 @@ async function setupWallet() {
           $("#net-dot").style.backgroundColor = "var(--bad)";
         }
         $("#net-dot").style.backgroundColor = "var(--ok)";
-        setEmulatorUrl({ simple: true, entropy: CONNECTED_ADDR.toLowerCase() });
       } else {
         WALLET_CLIENT = null;
-        setEmulatorUrl({ simple: true });
         $("#net-dot").style.backgroundColor = "var(--unnavailable)";
       }
+      setEmulatorUrl(playParams());
       renderBoard();
+      renderRunOverlay(); // wallet gating on the review step
     } catch (_) {}
   };
   btn.addEventListener("click", async () => {
@@ -357,55 +396,205 @@ const REPLAY_STOPPING_MS = 3_000;
 // twice without the player explicitly asking.
 const SUBMITTED_PAYLOADS = new Map();
 
-const SUBMIT_NOTE_MS = 20_000;
 // The node needs a moment to process the input; refresh the board a few times.
 const BOARD_REFRESH_AFTER_SUBMIT_MS = [1_500, 15_000, 60_000];
-let noteTimer = null;
 
 const shortTx = (h) => (h ? `${h.slice(0, 10)}…` : "—");
 
+// -------------------------------------------------------------
+// Run overlay — the primary surface for the pending run
+// -------------------------------------------------------------
+// Shown over the (blurred) emulator whenever there is a pending run, unless
+// the player dismissed it for the run's CURRENT status: a status change
+// (sent → posted, failed…) brings it back. A rejected recording (oversized,
+// malformed) has no run to keep, so it is a one-off notice instead.
+let OVERLAY_HIDDEN_FOR = null; // status the player dismissed, or null
+let OVERLAY_NOTICE = null; // { kind: "rejected", text } | null
+let overlayWasVisible = false;
+
+const explorerUrl = () =>
+  getChain(CFG.CHAIN_ID)?.blockExplorers?.default?.url ?? null;
+
+function overlayVisible() {
+  if (OVERLAY_NOTICE) return true;
+  return !!PENDING_RUN && PENDING_RUN.status !== OVERLAY_HIDDEN_FOR;
+}
+
+function renderRunOverlay() {
+  const el = $("#run-overlay");
+  if (!el) return;
+  const visible = overlayVisible();
+  el.hidden = !visible;
+  $("#game-frame")?.classList.toggle("has-overlay", visible);
+  if (!visible) {
+    overlayWasVisible = false;
+    return;
+  }
+
+  const eyebrow = $("#run-eyebrow");
+  const scoreWrap = $("#run-score-wrap");
+  const errorEl = $("#run-error");
+  const text = $("#run-text");
+  const tx = $("#run-tx");
+  const primary = $("#run-primary");
+  const discard = $("#run-discard");
+  const resend = $("#run-resend");
+  const hint = $("#run-hint");
+
+  let m;
+  if (OVERLAY_NOTICE) {
+    m = {
+      kind: OVERLAY_NOTICE.kind,
+      eyebrow: "// run not submittable",
+      error: OVERLAY_NOTICE.text,
+      text: "this recording cannot go onchain · play again to record a new one",
+      score: null,
+      tx: null,
+      primary: { label: "Play again", action: "again", disabled: false },
+      discard: false,
+      resend: false,
+      busy: false,
+      hint: null,
+    };
+  } else {
+    m = runOverlayModel(PENDING_RUN, {
+      chainName: getChain(CFG.CHAIN_ID)?.name,
+      explorerUrl: explorerUrl(),
+      walletAvailable: !!window.ethereum,
+      walletConnected: !!CONNECTED_ADDR,
+      mismatch: LIFECYCLE_STATE.mismatch,
+    });
+  }
+  if (!m) {
+    el.hidden = true;
+    $("#game-frame")?.classList.remove("has-overlay");
+    return;
+  }
+
+  el.dataset.kind = m.kind;
+  el.classList.toggle("is-busy", !!m.busy);
+  eyebrow.textContent = m.eyebrow;
+
+  scoreWrap.hidden = m.score == null;
+  if (m.score != null) {
+    $("#run-score").textContent = fmtScore(m.score);
+    $("#run-score-label").textContent = m.scoreLabel ?? "";
+  }
+
+  errorEl.hidden = !m.error;
+  errorEl.textContent = m.error ?? "";
+  text.textContent = m.text ?? "";
+
+  tx.hidden = !m.tx;
+  if (m.tx) {
+    tx.textContent = "";
+    tx.append("tx ");
+    if (m.tx.url) {
+      const a = document.createElement("a");
+      a.href = m.tx.url;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.textContent = m.tx.short;
+      a.title = m.tx.hash;
+      tx.append(a);
+    } else {
+      const s = document.createElement("span");
+      s.textContent = m.tx.short;
+      s.title = m.tx.hash;
+      tx.append(s);
+    }
+  }
+
+  primary.hidden = !m.primary;
+  if (m.primary) {
+    primary.textContent = m.primary.label;
+    primary.dataset.action = m.primary.action;
+    primary.disabled = !!m.primary.disabled;
+    primary.title = m.primary.reason ?? "";
+  }
+  discard.hidden = !m.discard;
+  discard.disabled = !!m.busy;
+  resend.hidden = !m.resend;
+
+  const hintText = m.primary?.reason ?? m.hint ?? null;
+  hint.hidden = !hintText;
+  hint.textContent = hintText ?? "";
+  hint.className = `run-hint mono${m.primary?.reason ? " status-bad" : ""}`;
+
+  // Focus the action once per appearance so Enter/Space works; never steal
+  // focus on a mere re-render (wallet refresh) while the player reads.
+  if (!overlayWasVisible && m.primary && !m.primary.disabled) {
+    primary.focus({ preventScroll: true });
+  }
+  overlayWasVisible = true;
+}
+
+function dismissOverlay() {
+  OVERLAY_HIDDEN_FOR = PENDING_RUN?.status ?? null;
+  OVERLAY_NOTICE = null;
+  renderRunOverlay();
+  renderSubmitControls();
+}
+
+// Footer fallback while the overlay is dismissed: the same actions, one line.
 function renderSubmitControls() {
   const controls = $("#submit-controls");
   const btn = $("#retry-submit");
   const again = $("#resend-submit");
   if (!controls || !btn) return;
+  const submit = canSubmit(PENDING_RUN);
   const retry = canRetry(PENDING_RUN);
   const check = canCheck(PENDING_RUN);
-  controls.hidden = !(retry || check);
-  btn.textContent = check ? "↻ check status" : "↻ retry submit";
-  btn.title = check ? "Look the transaction up again" : "Submit the last run again";
+  controls.hidden = overlayVisible() || !(submit || retry || check);
+  btn.textContent = check
+    ? "↻ check status"
+    : retry
+      ? "↻ retry submit"
+      : "↑ submit run";
+  btn.title = check
+    ? "Look the transaction up again"
+    : retry
+      ? "Submit the last run again"
+      : "Submit the last run";
   if (again) again.hidden = !check;
 }
 
 function dispatchRun(event) {
+  const before = PENDING_RUN?.status ?? null;
   PENDING_RUN = runReducer(PENDING_RUN, event);
+  // A fresh recording always gets its review step, whatever was dismissed.
+  if (event?.type === "finished") OVERLAY_HIDDEN_FOR = null;
+  if (PENDING_RUN) OVERLAY_NOTICE = null;
+  // The status moved on: a dismissal applied to the old status only, so a
+  // retried submission that fails again is shown again.
+  if ((PENDING_RUN?.status ?? null) !== before) OVERLAY_HIDDEN_FOR = null;
+  renderRunOverlay();
   renderSubmitControls();
 }
 
-// Good news fades; a warning stays until the next action replaces it.
-function showSubmitNote(text, tone) {
-  const el = $("#submit-note");
-  if (!el) return;
-  clearTimeout(noteTimer);
-  if (!text) {
-    el.hidden = true;
-    el.textContent = "";
-    return;
-  }
-  el.hidden = false;
-  el.textContent = text;
-  el.dataset.tone = tone || "";
-  if (tone !== "bad")
-    noteTimer = setTimeout(() => {
-      el.hidden = true;
-    }, SUBMIT_NOTE_MS);
+function discardRun() {
+  dispatchRun({ type: "discard" });
+  OVERLAY_NOTICE = null;
+  renderRunOverlay();
+  setStatus("run discarded");
+  resetEmulator();
+}
+
+function playAgain() {
+  dispatchRun({ type: "discard" });
+  OVERLAY_NOTICE = null;
+  renderRunOverlay();
+  setStatus("READY");
+  resetEmulator();
 }
 
 const replayActive = () =>
-  $("#game-frame")?.classList.contains("is-replay") || $("#replay-controls")?.hidden === false;
+  $("#game-frame")?.classList.contains("is-replay") ||
+  $("#replay-controls")?.hidden === false;
 
 const isReplayPayload = (payload) =>
-  !!REPLAY_TAPE && sameBytes(toBytes(payload).slice(OUTHASH_BYTES), REPLAY_TAPE);
+  !!REPLAY_TAPE &&
+  sameBytes(toBytes(payload).slice(OUTHASH_BYTES), REPLAY_TAPE);
 
 // Wait for the pending run's receipt and settle the state accordingly.
 async function settlePending() {
@@ -418,23 +607,22 @@ async function settlePending() {
   if (outcome === "success") {
     dispatchRun({ type: "ok", txHash });
     setStatus(`submitted ✓ tx ${shortTx(txHash)}`, "ok");
-    showSubmitNote(
-      "run posted onchain · it can take a few minutes to show up on the leaderboard while the node processes it",
-      "ok",
-    );
-    for (const ms of BOARD_REFRESH_AFTER_SUBMIT_MS) setTimeout(fetchLeaderboard, ms);
+    for (const ms of BOARD_REFRESH_AFTER_SUBMIT_MS)
+      setTimeout(fetchLeaderboard, ms);
   } else if (outcome === "reverted") {
     SUBMITTED_PAYLOADS.delete(payload);
-    dispatchRun({ type: "reverted", error: "transaction reverted" });
+    dispatchRun({
+      type: "reverted",
+      error: "the transaction reverted onchain · your run is kept, retry sends it again",
+    });
     setStatus(`tx ${shortTx(txHash)} reverted onchain`, "bad");
-    showSubmitNote("the transaction reverted · your run is kept, retry sends it again", "bad");
   } else {
-    dispatchRun({ type: "unconfirmed", txHash, error: "receipt not seen yet" });
+    dispatchRun({
+      type: "unconfirmed",
+      txHash,
+      error: "broadcast, but this RPC has not shown a receipt yet",
+    });
     setStatus(`tx ${shortTx(txHash)} sent · not confirmed yet`, "bad");
-    showSubmitNote(
-      `tx ${shortTx(txHash)} was broadcast but this RPC has not shown a receipt · check your wallet before sending again`,
-      "bad",
-    );
   }
 }
 
@@ -443,7 +631,6 @@ async function checkPending() {
   if (!PENDING_RUN?.txHash || isBusy(PENDING_RUN)) return;
   dispatchRun({ type: "sent", txHash: PENDING_RUN.txHash });
   setStatus(`checking tx ${shortTx(PENDING_RUN.txHash)}…`);
-  showSubmitNote(null);
   await settlePending();
 }
 
@@ -463,18 +650,17 @@ async function submitPending({ resend = false } = {}) {
   if (canCheck(PENDING_RUN) && !resend) return checkPending();
   const prior = SUBMITTED_PAYLOADS.get(payload);
   if (prior && !resend) {
-    dispatchRun({ type: "unconfirmed", txHash: prior, error: "already broadcast" });
+    dispatchRun({
+      type: "unconfirmed",
+      txHash: prior,
+      error: "this run was already sent · check its status before sending it again",
+    });
     setStatus(`this run was already sent · tx ${shortTx(prior)}`, "bad");
-    showSubmitNote(
-      `this run was already sent as tx ${shortTx(prior)} · check its status before sending it again`,
-      "bad",
-    );
     return;
   }
 
   dispatchRun({ type: resend ? "resend" : "submit" });
   setStatus("submitting run…");
-  showSubmitNote(null);
   let txHash;
   try {
     txHash = await submitGameplay(payload);
@@ -485,7 +671,6 @@ async function submitPending({ resend = false } = {}) {
     const reason = submitErrorMessage(err, chainName);
     dispatchRun({ type: "failed", error: reason });
     setStatus(`submit failed · ${reason}`, "bad");
-    showSubmitNote("your run is kept · sort out the wallet or network and retry", "bad");
     return;
   }
   SUBMITTED_PAYLOADS.set(payload, txHash);
@@ -494,9 +679,29 @@ async function submitPending({ resend = false } = {}) {
   await settlePending();
 }
 
+// A recording that cannot go onchain: no run to keep, but say why, clearly.
+function rejectRun(text) {
+  dispatchRun({ type: "reject" });
+  OVERLAY_NOTICE = { kind: "rejected", text };
+  OVERLAY_HIDDEN_FOR = null;
+  renderRunOverlay();
+  renderSubmitControls();
+  setStatus(text, "bad");
+}
+
 window.addEventListener("message", (e) => {
   const params = e.data;
   if (!params || typeof params !== "object") return;
+
+  // Patched emulators announce the first frame (see the fullscreen gate in the
+  // emulator). Bring the canvas into view and get any stale overlay out of the
+  // way; the pending run, if any, stays reachable from the footer.
+  if (params.rivemuOnBegin) {
+    scrollToEmulator();
+    if (overlayVisible()) dismissOverlay();
+    return;
+  }
+
   if (!(params.rivemuOnFinish && params.outhash && params.tape)) return;
 
   const isReplayTape = sameBytes(params.tape, REPLAY_TAPE);
@@ -508,6 +713,7 @@ window.addEventListener("message", (e) => {
   dispatchRun({
     type: "finished",
     payload: gameplayPayload,
+    score: scoreFromOutcard(params.outcard),
     replaying: replayActive() || stopping,
     isReplayTape,
   });
@@ -517,23 +723,41 @@ window.addEventListener("message", (e) => {
     return;
   }
 
+  // The overlay lives in this page; a canvas fullscreened inside the iframe
+  // would hide it.
+  exitFullscreen();
+
   if (!isHex(gameplayPayload)) {
-    dispatchRun({ type: "reject" });
-    setStatus("invalid payload", "bad");
+    rejectRun("invalid payload");
     return;
   }
   // Too long for the InputBox: say so before the wallet ever opens.
   const size = checkPayloadSize(gameplayPayload);
   if (!size.ok) {
-    dispatchRun({ type: "reject" });
-    setStatus(size.message, "bad");
+    rejectRun(size.message);
     return;
   }
-  submitPending();
+  // Review step: nothing is sent until the player presses Submit.
+  setStatus("run recorded · review and submit");
+  scrollToEmulator();
 });
 
+// Footer fallback (overlay dismissed) and overlay actions share the handlers.
 $("#retry-submit")?.addEventListener("click", () => submitPending());
-$("#resend-submit")?.addEventListener("click", () => submitPending({ resend: true }));
+$("#resend-submit")?.addEventListener("click", () =>
+  submitPending({ resend: true }),
+);
+$("#run-primary")?.addEventListener("click", (e) => {
+  const action = e.currentTarget.dataset.action;
+  if (action === "again") playAgain();
+  else if (action === "resend") submitPending({ resend: true });
+  else submitPending(); // "submit" and "check": submitPending routes an unconfirmed run to checkPending
+});
+$("#run-resend")?.addEventListener("click", () =>
+  submitPending({ resend: true }),
+);
+$("#run-discard")?.addEventListener("click", discardRun);
+$("#run-close")?.addEventListener("click", dismissOverlay);
 
 // =============================================================
 // ICONS
@@ -755,7 +979,8 @@ async function loadReplay(i) {
   if (!r) return;
   // A leaderboard tape is never ours to submit.
   dispatchRun({ type: "replay" });
-  showSubmitNote(null);
+  OVERLAY_NOTICE = null;
+  renderRunOverlay();
   scrollToEmulator();
   frame().classList.add("is-replay");
   $("#replay-meta").textContent =
@@ -768,7 +993,8 @@ async function loadReplay(i) {
       application: APP_REF,
       inputIndex: r.inputIndex,
     });
-    if (!res.decodedData?.payload) throw new Error("input has no decoded payload");
+    if (!res.decodedData?.payload)
+      throw new Error("input has no decoded payload");
     const inputBytes = toBytes(res.decodedData.payload);
     // Strip the first 32 bytes (outhash) — what remains is the gameplay tape.
     const tape = inputBytes.slice(OUTHASH_BYTES);
@@ -799,7 +1025,9 @@ async function loadReplay(i) {
       }
     };
     window.addEventListener("message", __uploadListener);
-    setEmulatorUrl({});
+    // reset:true — a second replay in a row would otherwise reuse the same
+    // URL, fire no hashchange, and never emit rivemuUploaded.
+    setEmulatorUrl({ simple: true }, { reset: true });
   } catch (e) {
     console.error("replay load failed:", e);
     setStatus(`replay failed · ${humanError(e)}`, "bad");
@@ -810,7 +1038,6 @@ async function loadReplay(i) {
 function exitReplay() {
   SELECTED_RUN_IDX = null;
   dispatchRun({ type: "exit-replay" });
-  showSubmitNote(null);
   // Resetting the frame below stops the replay, and the emulator reports
   // that stop as a finish carrying the replayed tape. Drop it.
   REPLAY_STOPPING = true;
@@ -824,11 +1051,7 @@ function exitReplay() {
     window.removeEventListener("message", __uploadListener);
     __uploadListener = null;
   }
-  setEmulatorUrl(
-    CONNECTED_ADDR
-      ? { simple: true, entropy: CONNECTED_ADDR.toLowerCase() }
-      : { simple: true },
-  );
+  resetEmulator();
   setStatus("READY");
   renderBoard();
 }
@@ -859,7 +1082,9 @@ function scrollToEmulator() {
   const vh = window.innerHeight || document.documentElement.clientHeight || 0;
   const visible = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
   if (r.height > 0 && visible / r.height >= 0.8) return; // already in view
-  const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+  const reduced = window.matchMedia?.(
+    "(prefers-reduced-motion: reduce)",
+  )?.matches;
   el.scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "center" });
 }
 
@@ -913,11 +1138,17 @@ function crossCheckConfig() {
   const { nodeInfo, app } = LIFECYCLE_STATE;
   const out = [];
   if (nodeInfo && nodeInfo.chainId !== CFG_CHAIN_ID)
-    out.push(`node is on chain ${nodeInfo.chainId}, site is configured for ${CFG_CHAIN_ID}`);
+    out.push(
+      `node is on chain ${nodeInfo.chainId}, site is configured for ${CFG_CHAIN_ID}`,
+    );
   if (app && !sameAddr(app.inputBoxAddress, CFG.INPUT_BOX_ADDRESS))
-    out.push(`node InputBox is ${app.inputBoxAddress}, site has ${CFG.INPUT_BOX_ADDRESS}`);
+    out.push(
+      `node InputBox is ${app.inputBoxAddress}, site has ${CFG.INPUT_BOX_ADDRESS}`,
+    );
   if (app && !sameAddr(app.applicationAddress, CFG.APPLICATION_ADDRESS))
-    out.push(`node application is ${app.applicationAddress}, site has ${CFG.APPLICATION_ADDRESS}`);
+    out.push(
+      `node application is ${app.applicationAddress}, site has ${CFG.APPLICATION_ADDRESS}`,
+    );
   LIFECYCLE_STATE.mismatch = out;
 }
 
@@ -947,7 +1178,9 @@ async function fetchLifecycle() {
 
     // Application is deployment config — fetch once and keep it.
     if (!LIFECYCLE_STATE.app) {
-      LIFECYCLE_STATE.app = await nodeClient.getApplication({ application: APP_REF });
+      LIFECYCLE_STATE.app = await nodeClient.getApplication({
+        application: APP_REF,
+      });
       crossCheckConfig();
     }
 
@@ -955,7 +1188,13 @@ async function fetchLifecycle() {
     // the oldest one consensus is still working on. Under PRT the tournament
     // hangs off the latter; the former is usually just OPEN.
     const [newestR, settlingR, lastR] = await Promise.all([
-      safe(nodeClient.listEpochs({ application: APP_REF, descending: true, limit: 1 })),
+      safe(
+        nodeClient.listEpochs({
+          application: APP_REF,
+          descending: true,
+          limit: 1,
+        }),
+      ),
       safe(
         nodeClient.listEpochs({
           application: APP_REF,
@@ -998,7 +1237,10 @@ async function fetchLifecycle() {
         (!settling || BigInt(settling.index) !== BigInt(consensus.epochNumber))
       ) {
         const r = await safe(
-          nodeClient.getEpoch({ application: APP_REF, epochIndex: consensus.epochNumber }),
+          nodeClient.getEpoch({
+            application: APP_REF,
+            epochIndex: consensus.epochNumber,
+          }),
         );
         settling = r.ok ? r.v : null;
       }
@@ -1029,7 +1271,9 @@ async function fetchLifecycle() {
       LIFECYCLE_STATE.acceptedEpoch == null ||
       BigInt(LIFECYCLE_STATE.acceptedEpoch.index) !== BigInt(lastIdx)
     ) {
-      const r = await safe(nodeClient.getEpoch({ application: APP_REF, epochIndex: lastIdx }));
+      const r = await safe(
+        nodeClient.getEpoch({ application: APP_REF, epochIndex: lastIdx }),
+      );
       LIFECYCLE_STATE.acceptedEpoch = r.ok ? r.v : null;
     }
 
@@ -1063,7 +1307,8 @@ async function fetchLifecycle() {
 // ~2s blocks on Base Sepolia; good enough to turn a block delta into a feel.
 const BLOCK_SECONDS = 2;
 
-const fmtInputs = (n) => (n == null ? "— inputs" : `${n} input${n === 1 ? "" : "s"}`);
+const fmtInputs = (n) =>
+  n == null ? "— inputs" : `${n} input${n === 1 ? "" : "s"}`;
 
 // One epoch row: state (with its dot) on the left, epoch number on the right.
 function setEpochHead(id, label, tone, index, pulse) {
@@ -1117,7 +1362,13 @@ function renderLifecycle() {
   if (openEl) {
     if (currentEpoch && !openIsSettling) {
       const st = epochStatus(currentEpoch);
-      setEpochHead("open", st.label, st.tone, currentEpoch.index, st.tone === "open");
+      setEpochHead(
+        "open",
+        st.label,
+        st.tone,
+        currentEpoch.index,
+        st.tone === "open",
+      );
       $("#lc-open-inputs").textContent = fmtInputs(inputsOf(currentEpoch));
       openEl.hidden = false;
     } else {
@@ -1129,7 +1380,13 @@ function renderLifecycle() {
   if (settlingEl) {
     if (settling) {
       const live = isLivePhase({ key: settling.key });
-      setEpochHead("settling", settling.label, settling.tone, settling.epochIndex, live);
+      setEpochHead(
+        "settling",
+        settling.label,
+        settling.tone,
+        settling.epochIndex,
+        live,
+      );
       $("#lc-settling-inputs").textContent = fmtInputs(settling.inputs);
       $("#lc-settling-detail").textContent = settling.detail ?? "";
       const noteEl = $("#lc-settling-node");
@@ -1178,7 +1435,8 @@ function renderLifecycle() {
     note.textContent = text ?? "";
     note.className = `lc-note mono status-${tone}`;
   }
-  if (mismatch.length) setStatus("config mismatch — submissions disabled", "bad");
+  if (mismatch.length)
+    setStatus("config mismatch — submissions disabled", "bad");
 
   // The How-modal shows both values when they differ, so the operator can see
   // which side is stale.
@@ -1304,24 +1562,11 @@ document.addEventListener("click", (e) => {
   if (e.target.matches("[data-close]")) closeModal();
 });
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !$("#how-modal").hidden) closeModal();
+  if (e.key !== "Escape") return;
+  if (!$("#how-modal").hidden) closeModal();
+  else if (overlayVisible()) dismissOverlay();
 });
 if (location.hash === "#how") openModal();
-
-// =============================================================
-// RELOAD
-// =============================================================
-$("#reload-btn")?.addEventListener("click", async () => {
-  const btn = $("#reload-btn");
-  btn.disabled = true;
-  const old = btn.textContent;
-  btn.textContent = "↻ reloading…";
-  await Promise.all([fetchLeaderboard(), fetchLifecycle()]);
-  setTimeout(() => {
-    btn.textContent = old;
-    btn.disabled = false;
-  }, 300);
-});
 
 // =============================================================
 // cartridge label — click to copy the application address
@@ -1363,7 +1608,10 @@ async function copyText(text) {
     chip.dataset.label = ok ? "copied ✓" : "copy failed";
     chip.classList.add(ok ? "copied" : "copy-failed");
     clearTimeout(copyTimer);
-    copyTimer = setTimeout(() => chip.classList.remove("copied", "copy-failed"), 1200);
+    copyTimer = setTimeout(
+      () => chip.classList.remove("copied", "copy-failed"),
+      1200,
+    );
   });
 }
 

@@ -478,15 +478,81 @@ SCENARIOS.replayexit = {
   forbid: ["submitting", "submit failed", "retry submit", "wallet not connected"],
 };
 
-// Same sequence, then a finish with a different tape: a real recording, which
-// must go down the submit path (and fail here for lack of a wallet).
+// Same sequence, then a finish with a different tape: a real recording. It is
+// NOT submitted by itself any more — it lands in the review overlay with the
+// local score decoded from the outcard. No wallet in headless Chrome, so the
+// Submit button is disabled with a reason.
+const OUTCARD = Array.from(new TextEncoder().encode('JSON{"score": 4321, "kills": 2}'));
+const finishWithOutcard = (outhashByte, tape) =>
+  `window.postMessage({ rivemuOnFinish: true, outhash: "${outhashByte}".repeat(32), tape: new Uint8Array([${tape.join(",")}]), outcard: new Uint8Array([${OUTCARD.join(",")}]) }, "*");`;
 SCENARIOS.newrun = {
   ...SCENARIOS.replayexit,
   hooks: `${SCENARIOS.replayexit.hooks}
     await sleep(300);
-    ${finishMsg("11", [9, 9, 9])}`,
-  expect: ["submit failed · wallet not connected", "retry submit", "your run is kept"],
-  forbid: ["replay stopped", "check status", "send again anyway"],
+    ${finishWithOutcard("11", [9, 9, 9])}`,
+  expect: ["// run recorded", "4,321", "local score", "Submit run", "install a wallet to submit", "Discard", "run recorded · review and submit"],
+  forbid: ["replay stopped", "submitting", "submit failed", "wallet not connected", "check status", "send again anyway", "↑ submit run"],
+};
+
+// Discard: the run is dropped, the overlay goes, the emulator is reset.
+SCENARIOS.rundiscard = {
+  ...SCENARIOS.newrun,
+  hooks: `${SCENARIOS.newrun.hooks}
+    await sleep(200);
+    document.getElementById("run-discard").click();`,
+  expect: ["run discarded"],
+  forbid: ["// run recorded", "Submit run", "submit failed", "↑ submit run"],
+};
+
+// × keeps the run: the footer row offers the submit instead.
+SCENARIOS.rundismiss = {
+  ...SCENARIOS.newrun,
+  hooks: `${SCENARIOS.newrun.hooks}
+    await sleep(200);
+    document.getElementById("run-close").click();`,
+  expect: ["↑ submit run", "run recorded · review and submit"],
+  forbid: ["// run recorded", "Submit run", "submit failed", "run discarded"],
+};
+
+// Esc does the same as ×.
+SCENARIOS.runesc = {
+  ...SCENARIOS.rundismiss,
+  hooks: `${SCENARIOS.newrun.hooks}
+    await sleep(200);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));`,
+};
+
+// With a wallet installed, Submit is live. The stub rejects the account
+// request (EIP-1193 code 4001 = user rejected), so the submission fails before
+// anything is broadcast: the overlay must say so and offer Retry + Discard.
+const ETHEREUM_STUB = `window.ethereum = {
+  isStub: true,
+  on() {},
+  async request({ method }) {
+    if (method === "eth_chainId") return "0x7a69";
+    if (method === "eth_accounts") return [];
+    if (method === "eth_requestAccounts") { const e = new Error("User rejected the request."); e.code = 4001; throw e; }
+    throw new Error("stub: " + method);
+  },
+};`;
+SCENARIOS.runfail = {
+  ...SCENARIOS.newrun,
+  prelude: ETHEREUM_STUB,
+  hooks: `${SCENARIOS.newrun.hooks}
+    await sleep(200);
+    document.getElementById("run-primary").click();
+    await sleep(500);`,
+  expect: ["// submit failed", "cancelled in wallet", "Retry submit", "your run is kept", "Discard", "submit failed · cancelled in wallet"],
+  forbid: ["// run recorded", "install a wallet", "check status", "send again anyway", "↑ submit run"],
+};
+
+// …and a dismissed failure is still retryable from the footer.
+SCENARIOS.runfaildismiss = {
+  ...SCENARIOS.runfail,
+  hooks: `${SCENARIOS.runfail.hooks}
+    document.getElementById("run-close").click();`,
+  expect: ["↻ retry submit", "submit failed · cancelled in wallet"],
+  forbid: ["// submit failed", "Retry submit", "↑ submit run"],
 };
 
 // -------------------------------------------------------------
@@ -558,8 +624,10 @@ function fakeL1(calls = {}, seen = []) {
 }
 
 // `hooksFor()` returns the current scenario's driver script (or null); it is
-// appended to index.html as a module so it runs after main.js.
-function staticSite(dir, hooksFor = () => null) {
+// appended to index.html as a module so it runs after main.js. `preludeFor()`
+// returns a classic script inserted BEFORE main.js (a window.ethereum stub,
+// for instance), so main.js sees it at startup.
+function staticSite(dir, hooksFor = () => null, preludeFor = () => null) {
   const types = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".ico": "image/x-icon" };
   return http.createServer((req, res) => {
     const path = req.url === "/" ? "/index.html" : req.url.split("?")[0];
@@ -568,11 +636,14 @@ function staticSite(dir, hooksFor = () => null) {
     const ext = path.slice(path.lastIndexOf("."));
     res.writeHead(200, { "content-type": types[ext] ?? "application/octet-stream" });
     let body = readFileSync(file);
-    const hooks = path === "/index.html" ? hooksFor() : null;
-    if (hooks)
-      body = Buffer.from(
-        body.toString("utf8").replace("</body>", `<script type="module">${hooks}</script></body>`),
-      );
+    if (path === "/index.html") {
+      let html = body.toString("utf8");
+      const prelude = preludeFor();
+      if (prelude) html = html.replace('<script type="module" src="main.js">', `<script>${prelude}</script><script type="module" src="main.js">`);
+      const hooks = hooksFor();
+      if (hooks) html = html.replace("</body>", `<script type="module">${hooks}</script></body>`);
+      body = Buffer.from(html);
+    }
     res.end(body);
   });
 }
@@ -704,7 +775,16 @@ const keys = only ? [only] : Object.keys(SCENARIOS);
 let failures = 0;
 const siteDir = await buildSite();
 let currentHooks = null;
-const site = await listen(staticSite(siteDir, () => currentHooks), SITE_PORT, SITE_HOST);
+let currentPrelude = null;
+const site = await listen(
+  staticSite(
+    siteDir,
+    () => currentHooks,
+    () => currentPrelude,
+  ),
+  SITE_PORT,
+  SITE_HOST,
+);
 
 for (const key of keys) {
   const scenario = SCENARIOS[key];
@@ -713,6 +793,7 @@ for (const key of keys) {
     process.exit(2);
   }
   currentHooks = scenario.hooks ?? null;
+  currentPrelude = scenario.prelude ?? null;
   const { server, seen } = fakeNode(scenario);
   await listen(server, Number(nodeUrl.port), hostFor(nodeUrl));
   const l1seen = [];

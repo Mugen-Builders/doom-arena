@@ -102,11 +102,14 @@ export function submitErrorMessage(err, chainName = "this chain") {
 // can look the receipt up instead of sending the same run twice. Any replay
 // wipes it, so a tape fetched from the leaderboard can never be submitted.
 //
-//   state: null | { payload, status, error, txHash }
+//   state: null | { payload, score, status, error, txHash }
 //   status: idle -> submitting -> sent -> ok
 //                              \-> failed        (no hash: re-send allowed)
 //                        sent -> unconfirmed     (hash known: check first)
 //                 unconfirmed -> failed via "reverted" (re-send allowed)
+//
+// "idle" is the review step: the run sits there until the player presses
+// Submit (or Discard). Nothing is sent without that click.
 
 export function runReducer(state, event) {
   switch (event?.type) {
@@ -116,7 +119,13 @@ export function runReducer(state, event) {
       // its finish after the replay flags are already cleared.
       return event.replaying || event.isReplayTape || !event.payload
         ? null
-        : { payload: event.payload, status: "idle", error: null, txHash: null };
+        : {
+            payload: event.payload,
+            score: Number.isFinite(event.score) ? event.score : null,
+            status: "idle",
+            error: null,
+            txHash: null,
+          };
     case "submit":
     case "resend":
       return state ? { ...state, status: "submitting", error: null, txHash: null } : null;
@@ -150,6 +159,7 @@ export function runReducer(state, event) {
         ? { ...state, status: "failed", error: event.error ?? "transaction reverted", txHash: null }
         : null;
     case "reject": // not submittable at all (bad or oversized payload)
+    case "discard": // the player chose not to submit (or is done with it)
     case "replay":
     case "exit-replay":
       return null;
@@ -158,9 +168,149 @@ export function runReducer(state, event) {
   }
 }
 
+export const canSubmit = (state) => state?.status === "idle";
 export const canRetry = (state) => state?.status === "failed";
 export const canCheck = (state) => state?.status === "unconfirmed";
 export const isBusy = (state) => state?.status === "submitting" || state?.status === "sent";
+
+// -------------------------------------------------------------
+// Score from the outcard
+// -------------------------------------------------------------
+// The emulator posts the final outcard with rivemuOnFinish. Doom's outcard is
+// "JSON{...}" with a "score" field — the same one the backend regex-extracts
+// (src/rives-barebones.cpp) — so the review step can show the local result
+// before the rollup proves it. Null when there is no readable score.
+export function scoreFromOutcard(outcard) {
+  if (!outcard) return null;
+  let text;
+  try {
+    if (typeof outcard === "string") text = outcard;
+    else {
+      const bytes = outcard instanceof Uint8Array ? outcard : Uint8Array.from(outcard);
+      text = new TextDecoder().decode(bytes);
+    }
+  } catch (_) {
+    return null;
+  }
+  if (text.startsWith("JSON")) {
+    try {
+      const n = Number(JSON.parse(text.slice(4))?.score);
+      if (Number.isFinite(n)) return n;
+    } catch (_) {
+      // fall through to the regex
+    }
+  }
+  const m = /"score"\s*:\s*(-?\d+)/.exec(text);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+// -------------------------------------------------------------
+// Overlay view-model
+// -------------------------------------------------------------
+// What the canvas overlay shows for a pending run. Pure: main.js applies it to
+// the DOM. `env`: { chainName, explorerUrl, walletAvailable, walletConnected,
+// mismatch } — explorerUrl is the chain's block explorer base (or null).
+//
+//   { kind, eyebrow, score, scoreLabel, text, tx: {hash, url}|null,
+//     primary: {label, action, disabled, reason}|null, discard, resend, busy }
+const shortHash = (h) => (h ? `${h.slice(0, 10)}…${h.slice(-6)}` : "—");
+
+export function runOverlayModel(run, env = {}) {
+  if (!run) return null;
+  const chain = env.chainName || "this chain";
+  const tx = run.txHash
+    ? {
+        hash: run.txHash,
+        short: shortHash(run.txHash),
+        url: env.explorerUrl ? `${String(env.explorerUrl).replace(/\/$/, "")}/tx/${run.txHash}` : null,
+      }
+    : null;
+  const base = {
+    score: run.score ?? null,
+    scoreLabel: run.score == null ? null : "local score · verified onchain after submission",
+    tx,
+    discard: false,
+    resend: false,
+    busy: false,
+    hint: null,
+  };
+  switch (run.status) {
+    case "idle": {
+      let disabled = false;
+      let reason = null;
+      let hint = null;
+      if (env.mismatch?.length) {
+        disabled = true;
+        reason = "submissions disabled · config mismatch";
+      } else if (!env.walletAvailable) {
+        disabled = true;
+        reason = "install a wallet to submit · your run is kept while this page is open";
+      } else if (!env.walletConnected) {
+        hint = "your wallet will ask to connect first";
+      }
+      return {
+        ...base,
+        kind: "review",
+        eyebrow: "// run recorded",
+        text: `Submitting posts your gameplay to the InputBox on ${chain}; your wallet will ask you to sign one transaction (gas only). The rollup replays it to prove the score.`,
+        primary: { label: "Submit run", action: "submit", disabled, reason },
+        discard: true,
+        hint,
+      };
+    }
+    case "submitting":
+      return {
+        ...base,
+        kind: "submitting",
+        eyebrow: "// submitting",
+        text: "confirm the transaction in your wallet…",
+        primary: null,
+        busy: true,
+      };
+    case "sent":
+      return {
+        ...base,
+        kind: "sent",
+        eyebrow: "// sent",
+        text: "waiting for confirmation…",
+        primary: null,
+        busy: true,
+      };
+    case "ok":
+      return {
+        ...base,
+        kind: "ok",
+        eyebrow: "// posted onchain ✓",
+        text: "it can take a few minutes to show up on the leaderboard while the node processes it",
+        primary: { label: "Play again", action: "again", disabled: false, reason: null },
+      };
+    case "failed":
+      return {
+        ...base,
+        kind: "failed",
+        eyebrow: "// submit failed",
+        text: "your run is kept · sort out the wallet or network and retry",
+        error: run.error ?? "unknown error",
+        primary: { label: "Retry submit", action: "submit", disabled: false, reason: null },
+        discard: true,
+      };
+    case "unconfirmed":
+      return {
+        ...base,
+        kind: "unconfirmed",
+        eyebrow: "// not confirmed yet",
+        text: "check your wallet before sending again",
+        error: run.error ?? "receipt not seen yet",
+        primary: { label: "Check status", action: "check", disabled: false, reason: null },
+        resend: true,
+        discard: true,
+      };
+    default:
+      return null;
+  }
+}
 
 // Byte-for-byte equality of two tapes (Uint8Array or array-like); false when
 // either is missing.

@@ -18,7 +18,7 @@
     <div class="topbar-inner">
       <div class="brand">
         <span class="brand-mark"></span>
-        <span>Doom Arena<small>// powered by Cartesi</small></span>
+        <span>Doom Arena<small>// <a href="https://cartesi.io" target="_blank" rel="noopener noreferrer">powered by Cartesi</a></small></span>
       </div>
       <nav class="nav">
         <a href="#how" id="how-link">How it works</a>
@@ -45,9 +45,6 @@
         </div>
         <h1>A <span class="accent">Verifiable Arena</span> for the FPS Classic.</h1>
         <p class="hero-sub">Every item, kill, secret, and level boosts your score — every second drops it. Submit your run and the Cartesi Rollup replays it deterministically to prove your score.</p>
-      </div>
-      <div class="title-actions">
-        <button class="btn ghost" id="reload-btn" title="Refresh leaderboard + rollup state">↻ Reload</button>
       </div>
     </section>
 
@@ -86,6 +83,29 @@
               <span>connecting to emulator…</span>
             </div>
           </div>
+
+          <!-- Run overlay: review a finished recording before it is submitted,
+               then follow the submission (sent / posted / failed). Blurs the
+               emulator underneath; × or Esc hides it and keeps the run. -->
+          <div class="run-overlay" id="run-overlay" hidden role="dialog" aria-modal="false" aria-labelledby="run-eyebrow">
+            <button class="run-close" id="run-close" type="button" aria-label="Close">×</button>
+            <div class="run-card">
+              <span class="label" id="run-eyebrow">// run recorded</span>
+              <div class="run-score" id="run-score-wrap" hidden>
+                <span class="mono" id="run-score">—</span>
+                <span class="label dim" id="run-score-label"></span>
+              </div>
+              <div class="run-error mono" id="run-error" hidden></div>
+              <p class="run-text" id="run-text"></p>
+              <div class="run-tx mono" id="run-tx" hidden></div>
+              <div class="run-actions" id="run-actions">
+                <button class="btn" id="run-primary" type="button"></button>
+                <button class="btn ghost" id="run-discard" type="button">Discard</button>
+                <button class="lc-link" id="run-resend" type="button" hidden>send again anyway</button>
+              </div>
+              <div class="run-hint mono" id="run-hint" hidden></div>
+            </div>
+          </div>
         </div>
 
         <!-- Canvas footer: replay scrubber / status -->
@@ -97,15 +117,13 @@
             <button class="ico-btn" id="rp-prev" title="Previous run">◀◀</button>
             <button class="ico-btn" id="rp-next" title="Next run">▶▶</button>
           </div>
-          <!-- Shown only while a recorded run failed to submit -->
+          <!-- Fallback while the run overlay is dismissed: submit / retry / check -->
           <div class="canvas-foot-right" id="submit-controls" hidden>
-            <button class="btn ghost" id="retry-submit" title="Submit the last run again">↻ retry submit</button>
+            <button class="btn ghost" id="retry-submit" title="Submit the last run">↑ submit run</button>
             <!-- unconfirmed tx only: explicit second broadcast -->
             <button class="lc-link" id="resend-submit" type="button" hidden>send again anyway</button>
           </div>
         </div>
-        <!-- One-line follow-up after a submission (auto-hides) -->
-        <div class="submit-note mono" id="submit-note" hidden></div>
       </div>
 
       <!-- RIGHT: side panel -->

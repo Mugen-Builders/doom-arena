@@ -131,14 +131,49 @@ test("submitErrorMessage falls back to the first line / shortMessage", () => {
 // -------------------------------------------------------------
 // pending-run state machine
 // -------------------------------------------------------------
-import { runReducer, canRetry, canCheck, isBusy, sameBytes } from "../src/submit.js";
+import {
+  runReducer,
+  canSubmit,
+  canRetry,
+  canCheck,
+  isBusy,
+  sameBytes,
+  scoreFromOutcard,
+  runOverlayModel,
+} from "../src/submit.js";
 
 const P = "0x" + "ab".repeat(40);
 
-test("a finished recording becomes the pending run", () => {
-  const s = runReducer(null, { type: "finished", payload: P, replaying: false });
-  assert.deepEqual(s, { payload: P, status: "idle", error: null, txHash: null });
+test("a finished recording becomes the pending run, waiting for the player", () => {
+  const s = runReducer(null, { type: "finished", payload: P, replaying: false, score: 1234 });
+  assert.deepEqual(s, { payload: P, score: 1234, status: "idle", error: null, txHash: null });
+  assert.equal(canSubmit(s), true);
   assert.equal(canRetry(s), false);
+  assert.equal(isBusy(s), false);
+});
+
+test("a finish without a readable score keeps score null", () => {
+  assert.equal(runReducer(null, { type: "finished", payload: P }).score, null);
+  assert.equal(runReducer(null, { type: "finished", payload: P, score: NaN }).score, null);
+  assert.equal(runReducer(null, { type: "finished", payload: P, score: "7" }).score, null);
+  assert.equal(runReducer(null, { type: "finished", payload: P, score: 0 }).score, 0);
+});
+
+test("discard drops the run from every status", () => {
+  for (const status of ["idle", "submitting", "sent", "ok", "unconfirmed", "failed"]) {
+    const s = { payload: P, score: 1, status, error: null, txHash: status === "idle" ? null : "0x1" };
+    assert.equal(runReducer(s, { type: "discard" }), null, status);
+  }
+  assert.equal(runReducer(null, { type: "discard" }), null);
+});
+
+test("canSubmit is true only for the review step", () => {
+  for (const status of ["idle", "submitting", "sent", "ok", "unconfirmed", "failed"]) {
+    const s = { payload: P, score: 1, status, error: null, txHash: null };
+    assert.equal(canSubmit(s), status === "idle", status);
+    assert.ok([canSubmit(s), canRetry(s), canCheck(s)].filter(Boolean).length <= 1, status);
+  }
+  assert.equal(canSubmit(null), false);
 });
 
 test("a replay finishing never becomes submittable", () => {
@@ -262,4 +297,130 @@ test("sameBytes compares tapes byte for byte", () => {
   assert.ok(!sameBytes(null, new Uint8Array([1])));
   assert.ok(!sameBytes(new Uint8Array([1]), undefined));
   assert.ok(sameBytes(new Uint8Array([]), new Uint8Array([])));
+});
+
+// -------------------------------------------------------------
+// score from the outcard
+
+const bytes = (s) => new TextEncoder().encode(s);
+
+test("scoreFromOutcard reads Doom's JSON outcard", () => {
+  assert.equal(scoreFromOutcard(bytes('JSON{"score": 1234, "kills": 3}')), 1234);
+  assert.equal(scoreFromOutcard(bytes('JSON{"kills":3,"score":-12}')), -12);
+  assert.equal(scoreFromOutcard(bytes('JSON{"score": 0}')), 0);
+  // array-like (structured clone may hand back a plain array) and string
+  assert.equal(scoreFromOutcard(Array.from(bytes('JSON{"score":9}'))), 9);
+  assert.equal(scoreFromOutcard('JSON{"score":5}'), 5);
+});
+
+test("scoreFromOutcard falls back to the backend's regex and otherwise gives null", () => {
+  // what src/rives-barebones.cpp matches: "score":\s*(\d+)\s*,
+  assert.equal(scoreFromOutcard(bytes('garbage "score": 77, more')), 77);
+  assert.equal(scoreFromOutcard(bytes("JSON{not json")), null);
+  assert.equal(scoreFromOutcard(bytes('JSON{"score":"abc"}')), null);
+  assert.equal(scoreFromOutcard(bytes("")), null);
+  assert.equal(scoreFromOutcard(undefined), null);
+  assert.equal(scoreFromOutcard(null), null);
+  assert.equal(scoreFromOutcard(42), null);
+});
+
+// -------------------------------------------------------------
+// overlay view-model
+
+const ENV = {
+  chainName: "Base Sepolia",
+  explorerUrl: "https://sepolia.basescan.org",
+  walletAvailable: true,
+  walletConnected: true,
+  mismatch: [],
+};
+const TX = "0x" + "ab".repeat(32);
+const run = (status, extra = {}) => ({ payload: P, score: 1234, status, error: null, txHash: null, ...extra });
+
+test("review step: score, explanation, Submit + Discard, nothing busy", () => {
+  const m = runOverlayModel(run("idle"), ENV);
+  assert.equal(m.kind, "review");
+  assert.equal(m.score, 1234);
+  assert.match(m.scoreLabel, /local score/);
+  assert.match(m.text, /Base Sepolia/);
+  assert.deepEqual(m.primary, { label: "Submit run", action: "submit", disabled: false, reason: null });
+  assert.equal(m.discard, true);
+  assert.equal(m.resend, false);
+  assert.equal(m.busy, false);
+  assert.equal(m.tx, null);
+  assert.equal(m.hint, null);
+});
+
+test("review step gating: no wallet and config mismatch disable Submit with a reason", () => {
+  const noWallet = runOverlayModel(run("idle"), { ...ENV, walletAvailable: false, walletConnected: false });
+  assert.equal(noWallet.primary.disabled, true);
+  assert.match(noWallet.primary.reason, /install a wallet/);
+  const mismatch = runOverlayModel(run("idle"), { ...ENV, mismatch: ["node InputBox is 0x…"] });
+  assert.equal(mismatch.primary.disabled, true);
+  assert.match(mismatch.primary.reason, /config mismatch/);
+  // wallet installed but not connected: still submittable, with a hint
+  const notConnected = runOverlayModel(run("idle"), { ...ENV, walletConnected: false });
+  assert.equal(notConnected.primary.disabled, false);
+  assert.match(notConnected.hint, /connect/);
+});
+
+test("submitting and sent are busy with no actions; sent carries the tx link", () => {
+  const sub = runOverlayModel(run("submitting"), ENV);
+  assert.equal(sub.kind, "submitting");
+  assert.equal(sub.busy, true);
+  assert.equal(sub.primary, null);
+  assert.equal(sub.discard, false);
+  const sent = runOverlayModel(run("sent", { txHash: TX }), ENV);
+  assert.equal(sent.kind, "sent");
+  assert.equal(sent.busy, true);
+  assert.equal(sent.tx.hash, TX);
+  assert.equal(sent.tx.url, `https://sepolia.basescan.org/tx/${TX}`);
+  assert.match(sent.tx.short, /^0xabababab…ababab$/);
+});
+
+test("no explorer (anvil): the tx is shown as plain text", () => {
+  const m = runOverlayModel(run("ok", { txHash: TX }), { ...ENV, explorerUrl: null });
+  assert.equal(m.tx.url, null);
+  assert.equal(m.tx.hash, TX);
+  // trailing slash on the explorer base is tolerated
+  const m2 = runOverlayModel(run("ok", { txHash: TX }), { ...ENV, explorerUrl: "https://x.io/" });
+  assert.equal(m2.tx.url, `https://x.io/tx/${TX}`);
+});
+
+test("posted: Play again only", () => {
+  const m = runOverlayModel(run("ok", { txHash: TX }), ENV);
+  assert.equal(m.kind, "ok");
+  assert.match(m.eyebrow, /posted onchain/);
+  assert.deepEqual(m.primary, { label: "Play again", action: "again", disabled: false, reason: null });
+  assert.equal(m.discard, false);
+  assert.equal(m.resend, false);
+});
+
+test("failed: the reason, Retry + Discard", () => {
+  const m = runOverlayModel(run("failed", { error: "cancelled in wallet" }), ENV);
+  assert.equal(m.kind, "failed");
+  assert.equal(m.error, "cancelled in wallet");
+  assert.match(m.text, /your run is kept/);
+  assert.equal(m.primary.action, "submit");
+  assert.equal(m.primary.label, "Retry submit");
+  assert.equal(m.discard, true);
+  assert.equal(m.resend, false);
+});
+
+test("unconfirmed: Check status, an explicit resend link, Discard, and the tx", () => {
+  const m = runOverlayModel(run("unconfirmed", { txHash: TX, error: "receipt not seen yet" }), ENV);
+  assert.equal(m.kind, "unconfirmed");
+  assert.equal(m.primary.action, "check");
+  assert.equal(m.resend, true);
+  assert.equal(m.discard, true);
+  assert.equal(m.tx.hash, TX);
+  assert.equal(m.error, "receipt not seen yet");
+});
+
+test("overlay model is null without a run or for an unknown status", () => {
+  assert.equal(runOverlayModel(null, ENV), null);
+  assert.equal(runOverlayModel(run("bogus"), ENV), null);
+  // and never shows a score it does not have
+  assert.equal(runOverlayModel(run("idle", { score: null }), ENV).score, null);
+  assert.equal(runOverlayModel(run("idle", { score: null }), ENV).scoreLabel, null);
 });

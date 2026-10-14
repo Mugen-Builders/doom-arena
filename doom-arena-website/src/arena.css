@@ -170,6 +170,13 @@ h4 {
     color: var(--fg-mute);
     margin-left: 4px;
 }
+.brand small a {
+    color: inherit;
+}
+.brand small a:hover {
+    color: var(--accent);
+    text-decoration: none;
+}
 
 .nav {
     display: flex;
@@ -337,7 +344,8 @@ h4 {
 @keyframes chip-flash {
     0% {
         background: color-mix(in oklab, var(--accent) 35%, transparent);
-        box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent) 25%, transparent);
+        box-shadow: 0 0 0 4px
+            color-mix(in oklab, var(--accent) 25%, transparent);
     }
     100% {
         background: transparent;
@@ -361,12 +369,6 @@ h4 {
     font-size: 13px;
     line-height: 1.55;
 }
-.title-actions {
-    display: flex;
-    gap: 10px;
-    align-items: center;
-}
-
 /* ============================================================
    stage
    ============================================================ */
@@ -553,20 +555,146 @@ h4 {
     padding: 5px 9px;
     font-size: 10px;
 }
-/* follow-up line under the canvas footer: "posted, give it a few minutes" or
-   "still here, retry" */
-.submit-note {
-    padding: 0 2px 6px;
+/* ============================================================
+   run overlay — review / submit / outcome, over the emulator
+   ============================================================ */
+.run-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 4; /* above canvas-slot (1), corners (2), replay badge (3) */
+    display: grid;
+    place-items: center;
+    padding: 16px;
+    background: color-mix(in oklab, var(--bg) 55%, transparent);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+}
+/* belt and braces: some engines do not blur iframe content behind a
+   backdrop-filter, so blur the frame itself as well */
+.canvas-frame.has-overlay #emulator-iframe {
+    filter: blur(6px) saturate(0.6);
+    transition: filter 0.2s;
+}
+.run-close {
+    position: absolute;
+    top: 10px;
+    right: 12px;
+    font-size: 22px;
+    line-height: 1;
+    color: var(--fg-mute);
+    padding: 2px 6px;
+}
+.run-close:hover {
+    color: var(--accent);
+}
+.run-card {
+    width: min(440px, 100%);
+    max-height: 100%;
+    overflow: auto;
+    display: grid;
+    gap: 12px;
+    padding: 18px 20px 16px;
+    background: var(--bg-elev);
+    border: 1px solid var(--accent);
+    box-shadow:
+        0 18px 48px rgba(0, 0, 0, 0.6),
+        0 0 0 1px var(--accent-dim);
+}
+.run-overlay[data-kind="failed"] .run-card,
+.run-overlay[data-kind="unconfirmed"] .run-card,
+.run-overlay[data-kind="rejected"] .run-card {
+    border-color: var(--bad);
+}
+.run-overlay[data-kind="ok"] .run-card {
+    border-color: var(--ok);
+}
+.run-overlay[data-kind="ok"] #run-eyebrow {
+    color: var(--ok);
+}
+.run-overlay[data-kind="failed"] #run-eyebrow,
+.run-overlay[data-kind="unconfirmed"] #run-eyebrow,
+.run-overlay[data-kind="rejected"] #run-eyebrow {
+    color: var(--bad);
+}
+.run-score {
+    display: grid;
+    gap: 4px;
+}
+.run-score .mono {
+    font-size: clamp(32px, 6vw, 48px);
+    font-weight: 500;
+    line-height: 1;
+    color: var(--fg);
+}
+.run-text {
+    margin: 0;
+    color: var(--fg-dim);
+    font-size: 13px;
+    line-height: 1.55;
+}
+.run-error {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--bad);
+    word-break: break-word;
+}
+.run-tx {
+    font-size: 11px;
+    color: var(--fg-dim);
+    word-break: break-all;
+}
+.run-tx a {
+    color: var(--accent);
+}
+.run-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+}
+.run-actions .btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+    background: transparent;
+    color: var(--accent);
+}
+.run-hint {
     font-size: 10px;
     letter-spacing: 0.06em;
     line-height: 1.5;
     color: var(--fg-mute);
 }
-.submit-note[data-tone="ok"] {
-    color: var(--ok);
-}
-.submit-note[data-tone="bad"] {
+.run-hint.status-bad {
     color: var(--bad);
+}
+.run-overlay.is-busy #run-eyebrow::after {
+    content: "";
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin-left: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    vertical-align: middle;
+    animation: pulse 1.2s ease-in-out infinite;
+}
+/* the 4:3 frame is short on phones: tighten the card so the actions and the
+   hint stay in view (the card scrolls if it still does not fit) */
+@media (max-width: 520px) {
+    .run-overlay {
+        padding: 10px;
+    }
+    .run-card {
+        padding: 12px 14px 10px;
+        gap: 8px;
+    }
+    .run-score .mono {
+        font-size: 28px;
+    }
+    .run-text {
+        font-size: 12px;
+        line-height: 1.45;
+    }
 }
 
 /* ============================================================
