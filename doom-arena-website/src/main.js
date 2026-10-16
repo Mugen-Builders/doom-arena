@@ -67,6 +67,12 @@ import {
   deriveLastAccepted,
   isLivePhase,
   inputsOf,
+  fmtInputs,
+  inputBoxAbi,
+  fetchChainInputCount,
+  inputsInFlight,
+  isAccepted,
+  describeOpenInputs,
   describeSettling,
   describeStaging,
   describeDispute,
@@ -312,10 +318,7 @@ async function setupWallet() {
 // =============================================================
 // SUBMIT
 // =============================================================
-const inputBoxAbi = parseAbi([
-  "function addInput(address _app, bytes payload) payable",
-  "error InputTooLarge(address appContract, uint256 inputLength, uint256 maxInputLength)",
-]);
+// InputBox ABI (addInput + its revert + getNumberOfInputs): see ./prt.js.
 
 // Gas is estimated here, with the real sender on our own L1 RPC, and sent
 // explicitly. Left to the wallet, a failed estimate (no ETH for gas, flaky
@@ -607,8 +610,7 @@ async function settlePending() {
   if (outcome === "success") {
     dispatchRun({ type: "ok", txHash });
     setStatus(`submitted ✓ tx ${shortTx(txHash)}`, "ok");
-    for (const ms of BOARD_REFRESH_AFTER_SUBMIT_MS)
-      setTimeout(fetchLeaderboard, ms);
+    refreshAfterSubmit();
   } else if (outcome === "reverted") {
     SUBMITTED_PAYLOADS.delete(payload);
     dispatchRun({
@@ -1107,6 +1109,28 @@ document.addEventListener("pointerdown", (e) => {
   if (!emulatorEl()?.contains(e.target)) iframeHadFocus = false;
 });
 
+// -------------------------------------------------------------
+// Inline tooltips (ⓘ): hover/focus via CSS, tap toggles .open; Esc or a tap
+// elsewhere closes. One wrap per tooltip (.lc-inputs-wrap).
+// -------------------------------------------------------------
+for (const btn of $$(".lc-info")) {
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    btn.closest(".lc-inputs-wrap")?.classList.toggle("open");
+  });
+}
+// Also drops focus, since :focus-within keeps the box open on its own.
+const closeTips = () => {
+  $$(".lc-inputs-wrap.open").forEach((w) => w.classList.remove("open"));
+  if (document.activeElement?.closest?.(".lc-inputs-wrap")) document.activeElement.blur();
+};
+document.addEventListener("pointerdown", (e) => {
+  if (!e.target.closest?.(".lc-inputs-wrap")) closeTips();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeTips();
+});
+
 // =============================================================
 // LIFECYCLE
 // =============================================================
@@ -1118,6 +1142,7 @@ let LIFECYCLE_STATE = {
   lastAcceptedIndex: null, // node's view, or the contract's (sealed − 1), whichever is newer
   acceptedEpoch: null, // node Epoch for lastAcceptedIndex — its input count
   currentEpoch: null, // newest epoch — where inputs go
+  chainInputs: null, // { count, tag }: InputBox.getNumberOfInputs at the chain's pending block
   settlingEpoch: null, // the sealed epoch consensus is working on (node's record of it)
   consensus: null, // fetchConsensusState — the chain's view of the sealed epoch (PRT)
   loading: false,
@@ -1128,6 +1153,12 @@ let LIFECYCLE_STATE = {
 };
 
 const isPrt = () => LIFECYCLE_STATE.app?.consensusType === "PRT";
+
+// Which block tag the InputBox count is read at; sticky once "latest" had to
+// stand in for "pending" (see fetchChainInputCount).
+const CHAIN_TAG_MEMO = {};
+// Set when a post-submit refresh finds a lifecycle fetch already running.
+let LIFECYCLE_REFRESH_WANTED = false;
 
 const sameAddr = (a, b) =>
   !!a && !!b && String(a).toLowerCase() === String(b).toLowerCase();
@@ -1187,7 +1218,10 @@ async function fetchLifecycle() {
     // Two views of the epoch list: the newest epoch (collecting inputs) and
     // the oldest one consensus is still working on. Under PRT the tournament
     // hangs off the latter; the former is usually just OPEN.
-    const [newestR, settlingR, lastR] = await Promise.all([
+    // The chain's input count rides along: it is what tells a freshly posted
+    // input apart from one the node has indexed (see inputsInFlight). Read
+    // with the node's own addresses — the pair it is actually watching.
+    const [newestR, settlingR, lastR, chainInputs] = await Promise.all([
       safe(
         nodeClient.listEpochs({
           application: APP_REF,
@@ -1204,11 +1238,18 @@ async function fetchLifecycle() {
         }),
       ),
       safe(nodeClient.getLastAcceptedEpochIndex({ application: APP_REF })),
+      fetchChainInputCount({
+        l1Client,
+        inputBoxAddress: LIFECYCLE_STATE.app?.inputBoxAddress,
+        application: LIFECYCLE_STATE.app?.applicationAddress,
+        memo: CHAIN_TAG_MEMO,
+      }),
     ]);
     if (!newestR.ok) throw newestR.e;
     if (!settlingR.ok) throw settlingR.e;
 
     LIFECYCLE_STATE.currentEpoch = newestR.v.data[0] ?? null;
+    LIFECYCLE_STATE.chainInputs = chainInputs;
     let settling = settlingR.v.data[0] ?? null;
 
     // "No accepted epoch yet" is a state, not an error.
@@ -1220,7 +1261,8 @@ async function fetchLifecycle() {
     // Under PRT the chain decides which epoch is sealed and what state it is
     // in; the node's label for it can be stale (a claim it computed but never
     // submitted stays CLAIM_COMPUTED while the tournament fails on-chain).
-    // Under authority/quorum no chain calls are issued.
+    // Under authority/quorum the consensus/PRT reads are skipped (the InputBox
+    // count above is read regardless).
     let consensus = null;
     if (isPrt()) {
       consensus = await fetchConsensusState({
@@ -1294,6 +1336,7 @@ async function fetchLifecycle() {
       LIFECYCLE_STATE.lastAcceptedIndex = null;
       LIFECYCLE_STATE.acceptedEpoch = null;
       LIFECYCLE_STATE.currentEpoch = null;
+      LIFECYCLE_STATE.chainInputs = null;
       LIFECYCLE_STATE.settlingEpoch = null;
       LIFECYCLE_STATE.consensus = null;
       LIFECYCLE_STATE.prt = null;
@@ -1301,14 +1344,20 @@ async function fetchLifecycle() {
   }
   LIFECYCLE_STATE.loading = false;
   renderLifecycle();
-  if (!LIFECYCLE_STATE.unsupported && !LIFECYCLE_STATE.fatal) schedulePoll();
+  if (LIFECYCLE_STATE.unsupported || LIFECYCLE_STATE.fatal) return;
+  // A refresh asked for while this fetch ran (refreshAfterSubmit) must not be
+  // lost: this fetch's chain read may predate the input it is about.
+  if (LIFECYCLE_REFRESH_WANTED) {
+    LIFECYCLE_REFRESH_WANTED = false;
+    clearTimeout(pollTimer);
+    fetchLifecycle();
+    return;
+  }
+  schedulePoll();
 }
 
 // ~2s blocks on Base Sepolia; good enough to turn a block delta into a feel.
 const BLOCK_SECONDS = 2;
-
-const fmtInputs = (n) =>
-  n == null ? "— inputs" : `${n} input${n === 1 ? "" : "s"}`;
 
 // One epoch row: state (with its dot) on the left, epoch number on the right.
 function setEpochHead(id, label, tone, index, pulse) {
@@ -1354,22 +1403,51 @@ function renderLifecycle() {
 
   // ---- OPEN (newest) epoch; folded into the settling row when it is the same
   const openEl = $("#lc-open");
-  const openIsSettling =
+  // The newest epoch the node lists can be the accepted one: an authority node
+  // opens the next epoch only when it indexes an input for it. That epoch is
+  // the ACCEPTED row's, not this one's — here it stands for the epoch that is
+  // not open yet (its inputs, if any, are all still in flight).
+  const newestDone =
     !!currentEpoch &&
+    (isAccepted(currentEpoch) ||
+      (lastAcceptedIndex != null &&
+        BigInt(currentEpoch.index) <= BigInt(lastAcceptedIndex)));
+  const openEpoch = newestDone ? null : currentEpoch;
+  const openIsSettling =
+    !!openEpoch &&
     !!settling &&
     settling.epochIndex != null &&
-    BigInt(currentEpoch.index) === BigInt(settling.epochIndex);
+    BigInt(openEpoch.index) === BigInt(settling.epochIndex);
+  // No epoch collecting (fresh deploy, or the newest one settled) still gets
+  // the row when there is something to say: every onchain input past the
+  // node's total is in flight.
+  const flight = inputsInFlight({
+    epoch: openEpoch,
+    chain: LIFECYCLE_STATE.chainInputs,
+    indexed: newestDone ? currentEpoch.inputIndexUpperBound : null,
+  });
   if (openEl) {
-    if (currentEpoch && !openIsSettling) {
-      const st = epochStatus(currentEpoch);
-      setEpochHead(
-        "open",
-        st.label,
-        st.tone,
-        currentEpoch.index,
-        st.tone === "open",
-      );
-      $("#lc-open-inputs").textContent = fmtInputs(inputsOf(currentEpoch));
+    if (openEpoch ? !openIsSettling : !!flight) {
+      if (openEpoch) {
+        const st = epochStatus(openEpoch);
+        setEpochHead("open", st.label, st.tone, openEpoch.index, st.tone === "open");
+      } else {
+        setEpochHead("open", "OPEN", "dim", null, false);
+      }
+      const open = describeOpenInputs(flight, {
+        defaultBlock: LIFECYCLE_STATE.nodeInfo?.defaultBlock,
+      });
+      $("#lc-open-inputs").textContent = open.text;
+      const tip = $("#lc-open-inputs-tip");
+      if (tip) {
+        tip.replaceChildren(
+          ...open.tip.map((line) => {
+            const d = document.createElement("div");
+            d.textContent = line;
+            return d;
+          }),
+        );
+      }
       openEl.hidden = false;
     } else {
       openEl.hidden = true;
@@ -1639,6 +1717,24 @@ function schedulePoll() {
     fetchLeaderboard();
     fetchLifecycle(); // reschedules itself when it settles
   }, pollInterval());
+}
+
+// After a posted input: the leaderboard (the node needs a moment to process
+// it) and the Rollup-state panel (so "(1 input being processed)" shows within
+// seconds, not at the next idle poll) at the same marks. A lifecycle fetch
+// already in flight is not duplicated; it runs once more when it settles.
+function refreshAfterSubmit(delays = BOARD_REFRESH_AFTER_SUBMIT_MS) {
+  for (const ms of delays)
+    setTimeout(() => {
+      fetchLeaderboard();
+      if (LIFECYCLE_STATE.unsupported || LIFECYCLE_STATE.fatal) return;
+      if (LIFECYCLE_STATE.loading) {
+        LIFECYCLE_REFRESH_WANTED = true;
+        return;
+      }
+      clearTimeout(pollTimer);
+      fetchLifecycle();
+    }, ms);
 }
 
 setupWallet();

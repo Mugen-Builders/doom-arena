@@ -162,7 +162,16 @@
                 <span class="mono dim" id="lc-open-idx">epoch —</span>
               </div>
               <div class="lc-epoch-row">
-                <span class="mono" id="lc-open-inputs">— inputs</span>
+                <!-- "N inputs (M being processed)": the node's count plus the
+                     inputs the InputBox already holds that the node has not
+                     indexed yet; ⓘ explains both with the live numbers -->
+                <span class="lc-inputs-wrap">
+                  <span class="mono" id="lc-open-inputs">— inputs</span>
+                  <button type="button" class="lc-info" id="lc-open-inputs-info"
+                          aria-label="what these counts mean"
+                          aria-describedby="lc-open-inputs-tip">i</button>
+                  <div class="lc-tip mono" role="tooltip" id="lc-open-inputs-tip"></div>
+                </span>
               </div>
             </div>
 

@@ -15,6 +15,7 @@ import {
   DELETION_REASON,
   epochStatus,
   isSettled,
+  isAccepted,
   standingOf,
   isMatchActive,
   buildTournamentTree,
@@ -24,6 +25,11 @@ import {
   describeDispute,
   describeTree,
   daveConsensusAbi,
+  inputBoxAbi,
+  fmtInputs,
+  fetchChainInputCount,
+  inputsInFlight,
+  describeOpenInputs,
 } from "../src/prt.js";
 
 const css = readFileSync(new URL("../src/arena.css", import.meta.url), "utf8");
@@ -259,8 +265,8 @@ function stubChain(reads = {}, blockNumber = 1000n) {
       if (blockNumber instanceof Error) throw blockNumber;
       return blockNumber;
     },
-    readContract: async ({ address, functionName }) => {
-      calls.push(`${address}|${functionName}`);
+    readContract: async ({ address, functionName, blockTag }) => {
+      calls.push(`${address}|${functionName}${blockTag ? "@" + blockTag : ""}`);
       const v = reads[`${address}|${functionName}`] ?? reads[`*|${functionName}`];
       if (v === undefined) throw new Error(`revert: no ${functionName} on ${address}`);
       if (v instanceof Error) throw v;
@@ -1162,4 +1168,187 @@ test("inputsOf: index bounds to a count, else null", () => {
   assert.equal(inputsOf({ inputIndexLowerBound: 3, inputIndexUpperBound: 3 }), 0);
   assert.equal(inputsOf({ inputIndexLowerBound: 1n }), null);
   assert.equal(inputsOf(null), null);
+});
+
+// -------------------------------------------------------------
+// inputs in flight: onchain but not yet indexed by the node
+// -------------------------------------------------------------
+const openEpoch = { index: 9n, status: "OPEN", inputIndexLowerBound: 11n, inputIndexUpperBound: 13n };
+
+test("inputBoxAbi pins addInput + getNumberOfInputs (+ the InputTooLarge revert)", () => {
+  assert.deepEqual(
+    inputBoxAbi.filter((e) => e.type === "function").map(toFunctionSignature),
+    ["addInput(address,bytes)", "getNumberOfInputs(address)"],
+  );
+  assert.deepEqual(inputBoxAbi.filter((e) => e.type === "error").map((e) => e.name), ["InputTooLarge"]);
+});
+
+test("fmtInputs: singular, plural, unknown", () => {
+  assert.equal(fmtInputs(1), "1 input");
+  assert.equal(fmtInputs(0), "0 inputs");
+  assert.equal(fmtInputs(null), "— inputs");
+});
+
+test("fetchChainInputCount reads the InputBox at the pending block", async () => {
+  const chain = stubChain({ "0xB0B|getNumberOfInputs": 14n });
+  const r = await fetchChainInputCount({ l1Client: chain, inputBoxAddress: "0xB0B", application: "0xA99" });
+  assert.deepEqual(r, { count: 14n, tag: "pending" });
+  assert.deepEqual(chain.calls, ["0xB0B|getNumberOfInputs@pending"]);
+});
+
+test("fetchChainInputCount falls back to latest when pending is rejected, else null", async () => {
+  let n = 0;
+  const flaky = {
+    calls: [],
+    readContract: async ({ blockTag }) => {
+      flaky.calls.push(blockTag);
+      if (n++ === 0) throw new Error("pending block tag not supported");
+      return 7n;
+    },
+  };
+  const r = await fetchChainInputCount({ l1Client: flaky, inputBoxAddress: "0xB0B", application: "0xA99" });
+  assert.deepEqual(r, { count: 7n, tag: "latest" });
+  assert.deepEqual(flaky.calls, ["pending", "latest"]);
+
+  const down = stubChain({});
+  assert.equal(await fetchChainInputCount({ l1Client: down, inputBoxAddress: "0xB0B", application: "0xA99" }), null);
+  assert.deepEqual(down.calls, ["0xB0B|getNumberOfInputs@pending", "0xB0B|getNumberOfInputs@latest"]);
+
+  // missing pieces: no call at all
+  assert.equal(await fetchChainInputCount({ l1Client: down, inputBoxAddress: null, application: "0xA99" }), null);
+  assert.equal(await fetchChainInputCount({ l1Client: down, inputBoxAddress: "0xB0B", application: null }), null);
+  assert.equal(down.calls.length, 2);
+});
+
+test("fetchChainInputCount: the downgrade to latest is sticky through the memo", async () => {
+  const memo = {};
+  let rejectPending = true;
+  const rpc = {
+    calls: [],
+    readContract: async ({ blockTag }) => {
+      rpc.calls.push(blockTag);
+      if (blockTag === "pending" && rejectPending) throw new Error("unsupported block tag");
+      return 9n;
+    },
+  };
+  const args = { l1Client: rpc, inputBoxAddress: "0xB0B", application: "0xA99", memo };
+  assert.deepEqual(await fetchChainInputCount(args), { count: 9n, tag: "latest" });
+  assert.equal(memo.tag, "latest");
+  // pending would work now, but the poll keeps reading latest: one round trip,
+  // same wording as last time
+  rejectPending = false;
+  assert.deepEqual(await fetchChainInputCount(args), { count: 9n, tag: "latest" });
+  assert.deepEqual(rpc.calls, ["pending", "latest", "latest"]);
+  // a fresh memo (or none) starts at pending again
+  assert.deepEqual(await fetchChainInputCount({ ...args, memo: {} }), { count: 9n, tag: "pending" });
+});
+
+test("inputsInFlight: chain count minus the node's upper bound, clamped at 0", () => {
+  const f = inputsInFlight({ epoch: openEpoch, chain: { count: 14n, tag: "pending" } });
+  assert.deepEqual(f, { total: 2, lower: 11n, upper: 13n, chainCount: 14n, tag: "pending", processing: 1, noEpoch: false });
+  // the L1 RPC lagging behind the node is not "negative inputs"
+  assert.equal(inputsInFlight({ epoch: openEpoch, chain: { count: 12n, tag: "latest" } }).processing, 0);
+  assert.equal(inputsInFlight({ epoch: openEpoch, chain: { count: 13n, tag: "pending" } }).processing, 0);
+  // hex strings from the wire are fine too
+  assert.equal(inputsInFlight({ epoch: openEpoch, chain: { count: "0x10", tag: "pending" } }).processing, 3);
+  // chain unknown: the node's count still stands, processing unknown
+  const noChain = inputsInFlight({ epoch: openEpoch, chain: null });
+  assert.equal(noChain.total, 2);
+  assert.equal(noChain.processing, null);
+  assert.equal(noChain.chainCount, null);
+  // an epoch without bounds is a shape anomaly: unknown
+  assert.equal(inputsInFlight({ epoch: { index: 1n, status: "OPEN" }, chain: { count: 1n } }), null);
+  // no epoch on the node at all: the node's total is 0, everything onchain is in flight
+  assert.deepEqual(inputsInFlight({ epoch: null, chain: { count: 2n, tag: "pending" } }), {
+    total: 0, lower: 0n, upper: 0n, chainCount: 2n, tag: "pending", processing: 2, noEpoch: true,
+  });
+  assert.equal(inputsInFlight({ epoch: null, chain: null }), null);
+  assert.equal(inputsInFlight(), null);
+  // the newest epoch settled and the node has not opened the next one: its
+  // upper bound is the node's total, so only inputs past it are in flight
+  assert.deepEqual(inputsInFlight({ epoch: null, chain: { count: 2n, tag: "pending" }, indexed: "0x2" }), {
+    total: 0, lower: 2n, upper: 2n, chainCount: 2n, tag: "pending", processing: 0, noEpoch: true,
+  });
+  assert.equal(inputsInFlight({ epoch: null, chain: { count: 3n, tag: "latest" }, indexed: 2n }).processing, 1);
+  // an L1 RPC behind the node must not go negative here either
+  assert.equal(inputsInFlight({ epoch: null, chain: { count: 1n, tag: "latest" }, indexed: 2n }).processing, 0);
+  // chain unknown but the node's total known: the row still has something to say
+  const settledNoChain = inputsInFlight({ epoch: null, chain: null, indexed: 2n });
+  assert.equal(settledNoChain.processing, null);
+  assert.equal(settledNoChain.noEpoch, true);
+  assert.equal(settledNoChain.upper, 2n);
+});
+
+test("isAccepted: only CLAIM_ACCEPTED, case-insensitive", () => {
+  assert.equal(isAccepted({ status: "CLAIM_ACCEPTED" }), true);
+  assert.equal(isAccepted({ status: "claim_accepted" }), true);
+  for (const status of ["OPEN", "CLAIM_REJECTED", "CLAIM_FORECLOSED", "CLAIM_SUBMITTED", "", undefined])
+    assert.equal(isAccepted({ status }), false, status);
+  assert.equal(isAccepted(null), false);
+});
+
+test("describeOpenInputs: the row text", () => {
+  const flight = (count) => inputsInFlight({ epoch: openEpoch, chain: { count, tag: "pending" } });
+  assert.equal(describeOpenInputs(flight(14n)).text, "2 inputs (1 input being processed)");
+  assert.equal(describeOpenInputs(flight(16n)).text, "2 inputs (3 inputs being processed)");
+  assert.equal(describeOpenInputs(flight(13n)).text, "2 inputs");
+  assert.equal(describeOpenInputs(inputsInFlight({ epoch: openEpoch, chain: null })).text, "2 inputs");
+  assert.equal(describeOpenInputs(null).text, "— inputs");
+  assert.deepEqual(describeOpenInputs(null).tip, []);
+  const one = { ...openEpoch, inputIndexUpperBound: 12n };
+  assert.equal(describeOpenInputs(inputsInFlight({ epoch: one, chain: { count: 14n, tag: "latest" } })).text, "1 input (2 inputs being processed)");
+});
+
+test("describeOpenInputs: the tooltip carries the live numbers and the node's block tag", () => {
+  const d = describeOpenInputs(
+    inputsInFlight({ epoch: openEpoch, chain: { count: 14n, tag: "pending" } }),
+    { defaultBlock: "FINALIZED" },
+  );
+  assert.equal(d.tip.length, 3);
+  assert.equal(d.tip[0], "2 inputs: inputs the node has indexed for this epoch (indices 11–12).");
+  assert.match(d.tip[1], /^1 being processed: the InputBox holds 14 inputs for this app at the chain's pending block; the node reports 13\./);
+  assert.match(d.tip[1], /not yet picked up by the node/);
+  assert.match(d.tip[2], /reads the chain at its FINALIZED block/);
+  assert.match(d.tip[2], /few minutes/);
+
+  // nothing in flight: still explained, with 0
+  const zero = describeOpenInputs(inputsInFlight({ epoch: openEpoch, chain: { count: 13n, tag: "latest" } }), { defaultBlock: "latest" });
+  assert.match(zero.tip[1], /^0 being processed: the InputBox holds 13 inputs for this app at the chain's latest block; the node reports 13\./);
+  assert.match(zero.tip[2], /its LATEST block/);
+
+  // an empty epoch names the next index instead of an empty range
+  const empty = describeOpenInputs(inputsInFlight({ epoch: { ...openEpoch, inputIndexUpperBound: 11n }, chain: { count: 11n, tag: "pending" } }));
+  assert.equal(empty.tip[0], "0 inputs: the node has not indexed any input for this epoch yet (next index 11).");
+  assert.match(empty.tip[2], /its default block/);
+
+  // fresh deploy: no epoch on the node, two inputs already onchain
+  const fresh = describeOpenInputs(inputsInFlight({ epoch: null, chain: { count: 2n, tag: "pending" } }), { defaultBlock: "FINALIZED" });
+  assert.equal(fresh.text, "0 inputs (2 inputs being processed)");
+  assert.equal(fresh.tip[0], "0 inputs: the node has not created an epoch yet — nothing is indexed.");
+  assert.match(fresh.tip[1], /^2 being processed: the InputBox holds 2 inputs for this app at the chain's pending block; the node reports 0\./);
+
+  // newest epoch settled, next one not opened: the accepted inputs are not "being processed"
+  const settled = describeOpenInputs(inputsInFlight({ epoch: null, chain: { count: 2n, tag: "pending" }, indexed: 2n }), { defaultBlock: "FINALIZED" });
+  assert.equal(settled.text, "0 inputs");
+  assert.equal(settled.tip[0], "0 inputs: the node has not opened the next epoch yet — it does so when it indexes an input for it; the 2 inputs it reports belong to earlier epochs.");
+  assert.match(settled.tip[1], /^0 being processed: the InputBox holds 2 inputs for this app at the chain's pending block; the node reports 2\./);
+  const settledFlight = describeOpenInputs(inputsInFlight({ epoch: null, chain: { count: 3n, tag: "pending" }, indexed: 2n }));
+  assert.equal(settledFlight.text, "0 inputs (1 input being processed)");
+  assert.match(settledFlight.tip[1], /holds 3 inputs .* the node reports 2\./);
+  const settledNoChain = describeOpenInputs(inputsInFlight({ epoch: null, chain: null, indexed: 2n }));
+  assert.equal(settledNoChain.text, "0 inputs");
+  assert.equal(settledNoChain.tip[1], "onchain count unavailable (L1 RPC) — showing the node's count only.");
+
+  // chain read failed: say so instead of inventing a number
+  const noChain = describeOpenInputs(inputsInFlight({ epoch: openEpoch, chain: null }), { defaultBlock: "FINALIZED" });
+  assert.equal(noChain.tip[1], "onchain count unavailable (L1 RPC) — showing the node's count only.");
+  assert.equal(noChain.tip.length, 3);
+});
+
+test("the tooltip styles exist for the ⓘ, the box and its three triggers", () => {
+  // hover only where hover exists (touch keeps :hover after a tap)
+  assert.match(css, /@media \(hover: hover\) \{\s*\.lc-inputs-wrap:hover \.lc-tip/);
+  assert.match(css, /\.lc-inputs-wrap:focus-within \.lc-tip/);
+  assert.match(css, /\.lc-inputs-wrap\.open \.lc-tip/);
+  assert.match(css, /\.lc-info\s*\{/);
 });

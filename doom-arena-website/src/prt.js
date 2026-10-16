@@ -107,6 +107,12 @@ export function epochStatus(epoch) {
 export const isSettled = (epoch) =>
   TERMINAL_EPOCH_STATUS.includes(String(epoch?.status ?? "").toUpperCase());
 
+// Accepted is the one terminal state that also means "nothing newer is
+// collecting": an authority node opens the next epoch only once it indexes an
+// input for it, so the newest epoch it lists can be the accepted one.
+export const isAccepted = (epoch) =>
+  String(epoch?.status ?? "").toUpperCase() === "CLAIM_ACCEPTED";
+
 // TournamentStandingState
 export const TOURNAMENT_STANDING = {
   MATCHES_ACTIVE: { label: "DISPUTE ACTIVE", tone: "bad" },
@@ -194,6 +200,124 @@ export const inputsOf = (e) =>
   e?.inputIndexUpperBound != null && e?.inputIndexLowerBound != null
     ? Number(BigInt(e.inputIndexUpperBound) - BigInt(e.inputIndexLowerBound))
     : null;
+
+export const fmtInputs = (n) =>
+  n == null ? "— inputs" : `${n} input${n === 1 ? "" : "s"}`;
+
+// -------------------------------------------------------------
+// Inputs in flight: onchain but not yet indexed by the node
+// -------------------------------------------------------------
+// The node reads the chain at its default block (FINALIZED on the cloud node:
+// minutes behind) and only then runs each input through the machine, so a
+// freshly posted input is invisible in the OPEN epoch's bounds for a while.
+// The InputBox, read at the chain's PENDING block, is the leading edge. Input
+// indices are global and contiguous, so the OPEN epoch's upper bound is the
+// node's total and `chainCount - upperBound` is exactly the number of inputs
+// the node has not picked up yet.
+export const inputBoxAbi = parseAbi([
+  "function addInput(address _app, bytes payload) payable",
+  "function getNumberOfInputs(address appContract) view returns (uint256)",
+  "error InputTooLarge(address appContract, uint256 inputLength, uint256 maxInputLength)",
+]);
+
+// { count, tag } or null when the L1 RPC cannot answer. "pending" first, then
+// "latest" for RPCs that reject the pending tag. `memo` (a mutable { tag })
+// makes the downgrade sticky: once latest had to stand in for pending, every
+// later poll reads latest too, so the count and the tooltip's wording cannot
+// flip between polls on a transient error, and an RPC that rejects pending
+// costs one round trip, not two. Never throws.
+export async function fetchChainInputCount({ l1Client, inputBoxAddress, application, memo = null }) {
+  if (!l1Client || !inputBoxAddress || !application) return null;
+  const tags = memo?.tag === "latest" ? ["latest"] : ["pending", "latest"];
+  for (const tag of tags) {
+    const count = await safe(
+      l1Client.readContract({
+        address: inputBoxAddress,
+        abi: inputBoxAbi,
+        functionName: "getNumberOfInputs",
+        args: [application],
+        blockTag: tag,
+      }),
+    );
+    if (count != null) {
+      if (memo) memo.tag = tag;
+      return { count: BigInt(count), tag };
+    }
+  }
+  return null;
+}
+
+// Node epoch bounds + chain count -> what the OPEN row says. `processing` is
+// null when the chain count is unknown; an L1 RPC behind the node (the devnet
+// node reads LATEST) must not produce a negative, so it is clamped at 0.
+// No epoch on the node at all (fresh deploy, nothing indexed yet) is a real
+// state, not a gap: the node's total is 0, so every onchain input is in
+// flight — `noEpoch` says so.
+export function inputsInFlight({ epoch = null, chain = null, indexed = null } = {}) {
+  const chainCount = chain?.count != null ? BigInt(chain.count) : null;
+  const tag = chain?.tag ?? null;
+  if (epoch == null) {
+    // No epoch collecting inputs. `indexed` is the node's total so far (the
+    // newest, already settled epoch's upper bound) — zero on a fresh deploy.
+    if (chainCount == null && indexed == null) return null;
+    const upper = indexed == null ? 0n : BigInt(indexed);
+    const diff = chainCount == null ? null : chainCount - upper;
+    return {
+      total: 0,
+      lower: upper,
+      upper,
+      chainCount,
+      tag,
+      processing: diff == null ? null : diff > 0n ? Number(diff) : 0,
+      noEpoch: true,
+    };
+  }
+  const total = inputsOf(epoch);
+  if (total == null) return null;
+  const lower = BigInt(epoch.inputIndexLowerBound);
+  const upper = BigInt(epoch.inputIndexUpperBound);
+  const diff = chainCount == null ? null : chainCount - upper;
+  return {
+    total,
+    lower,
+    upper,
+    chainCount,
+    tag,
+    processing: diff == null ? null : diff > 0n ? Number(diff) : 0,
+    noEpoch: false,
+  };
+}
+
+// Row text plus the tooltip lines explaining both numbers with the live
+// values. `defaultBlock` is the node's (cartesi_getNodeInfo), e.g. "FINALIZED".
+export function describeOpenInputs(flight, { defaultBlock = null } = {}) {
+  if (!flight) return { text: fmtInputs(null), tip: [] };
+  const { total, lower, upper, chainCount, tag, processing, noEpoch } = flight;
+  const n = processing ?? 0;
+  const text = n > 0 ? `${fmtInputs(total)} (${fmtInputs(n)} being processed)` : fmtInputs(total);
+  const tip = [];
+  tip.push(
+    noEpoch
+      ? upper === 0n
+        ? "0 inputs: the node has not created an epoch yet — nothing is indexed."
+        : `0 inputs: the node has not opened the next epoch yet — it does so when it indexes an input for it; the ${fmtInputs(Number(upper))} it reports belong to earlier epochs.`
+      : total === 0
+        ? `${fmtInputs(total)}: the node has not indexed any input for this epoch yet (next index ${lower}).`
+        : `${fmtInputs(total)}: inputs the node has indexed for this epoch (indices ${lower}–${upper - 1n}).`,
+  );
+  if (processing == null) {
+    tip.push("onchain count unavailable (L1 RPC) — showing the node's count only.");
+  } else {
+    tip.push(
+      `${n} being processed: the InputBox holds ${fmtInputs(Number(chainCount))} for this app at the chain's ${tag} block; the node reports ${upper}. The difference is onchain but not yet picked up by the node.`,
+    );
+  }
+  const at = defaultBlock ? `its ${String(defaultBlock).toUpperCase()} block` : "its default block";
+  tip.push(
+    `The node reads the chain at ${at}, then runs each input through the machine; a freshly posted input takes a few minutes to appear here and on the leaderboard.`,
+  );
+  return { text, tip };
+}
 
 // -------------------------------------------------------------
 // tree

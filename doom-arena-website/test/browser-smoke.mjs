@@ -88,6 +88,24 @@ const CONSENSUS = "0x" + "da".repeat(20);
 const T_ROOT = "0x" + "aa".repeat(20);
 const T_INNER = "0x" + "bb".repeat(20);
 const PLAYER = (i) => getAddress("0x" + (i + 1).toString(16).padStart(40, "0"));
+// The posted-run scenario's tx and its (always successful) receipt.
+const TX_HASH = "0x" + "77".repeat(32);
+const receipt = (hash) => ({
+  transactionHash: hash,
+  transactionIndex: "0x0",
+  blockHash: H(0xb10c),
+  blockNumber: hex(L1_BLOCK),
+  from: PLAYER(0),
+  to: IBOX,
+  cumulativeGasUsed: "0x5208",
+  gasUsed: "0x5208",
+  effectiveGasPrice: "0x1",
+  contractAddress: null,
+  logs: [],
+  logsBloom: "0x" + "0".repeat(512),
+  status: "0x1",
+  type: "0x2",
+});
 
 const application = (over = {}) => ({
   name: "doom_arena",
@@ -400,6 +418,10 @@ const SCENARIOS = {
       "OPEN",
       "epoch #1",
       "4 inputs",
+      // no getNumberOfInputs answer above: the row keeps the node's count and
+      // the tooltip says the chain is missing instead of inventing a number
+      "4 inputs: inputs the node has indexed for this epoch (indices 0–3).",
+      "onchain count unavailable (L1 RPC)",
       "TOURNAMENT FAILED",
       "epoch #0",
       "0 inputs",
@@ -408,7 +430,7 @@ const SCENARIOS = {
       "no accepted epoch yet",
       "7 runs",
     ],
-    forbid: ["0xA18d", "settling epoch", "last accepted epoch", "live unreachable", "config mismatch", "DISPUTE"],
+    forbid: ["0xA18d", "settling epoch", "last accepted epoch", "live unreachable", "config mismatch", "DISPUTE", "being processed"],
   },
 
   // Authority, nothing disputed, no accepted epoch yet (-31001 is not an error).
@@ -555,6 +577,129 @@ SCENARIOS.runfaildismiss = {
   forbid: ["// submit failed", "Retry submit", "↑ submit run"],
 };
 
+// Fresh deploy: the node has no epoch yet while two inputs already sit in the
+// InputBox. The OPEN row must still appear and count them as in flight.
+SCENARIOS.noepoch = {
+  ...SCENARIOS.authority,
+  cartesi_listEpochs: () => page([]),
+  cartesi_getLastAcceptedEpochIndex: { error: { code: -31001, message: "Epoch not found" } },
+  l1: chain(l1Uint("getNumberOfInputs(address)", 2)),
+  expect: [
+    "AUTHORITY",
+    "OPEN",
+    "epoch —",
+    "0 inputs (2 inputs being processed)",
+    "the node has not created an epoch yet",
+    "2 being processed: the InputBox holds 2 inputs for this app at the chain's pending block; the node reports 0.",
+    "no accepted epoch yet",
+  ],
+  forbid: ["live unreachable", "config mismatch", "onchain count unavailable"],
+};
+
+// The newest epoch the node lists is the accepted one (an authority node opens
+// the next epoch only when it indexes an input for it). The top row must not
+// repeat it: it stands for the epoch that is not open yet.
+const settledOnly = (p) => (p.status ? page([]) : page([epoch(0, "CLAIM_ACCEPTED")]));
+SCENARIOS.settlednewest = {
+  ...SCENARIOS.authority,
+  cartesi_listEpochs: settledOnly,
+  cartesi_getLastAcceptedEpochIndex: { data: hex(0) },
+  cartesi_getEpoch: () => ({ data: epoch(0, "CLAIM_ACCEPTED") }),
+  l1: chain(l1Uint("getNumberOfInputs(address)", 2)), // epoch 0 has bounds 0..2
+  expect: [
+    "AUTHORITY",
+    "OPEN",
+    "epoch —",
+    "0 inputs",
+    "the node has not opened the next epoch yet",
+    "0 being processed: the InputBox holds 2 inputs for this app at the chain's pending block; the node reports 2.",
+    "ACCEPTED",
+    "epoch #0",
+    "2 inputs",
+  ],
+  forbid: ["being processed)", "no accepted epoch yet", "live unreachable", "config mismatch", "onchain count unavailable"],
+  exactly: { "epoch #0": 1 },
+};
+
+// Same, with one more input onchain than the node reports: it is in flight
+// for the epoch that is not open yet.
+SCENARIOS.settlednewestflight = {
+  ...SCENARIOS.settlednewest,
+  l1: chain(l1Uint("getNumberOfInputs(address)", 3)),
+  expect: [
+    "0 inputs (1 input being processed)",
+    "1 being processed: the InputBox holds 3 inputs for this app at the chain's pending block; the node reports 2.",
+    "ACCEPTED",
+    "epoch #0",
+    "2 inputs",
+  ],
+  forbid: ["no accepted epoch yet", "live unreachable", "config mismatch", "onchain count unavailable"],
+  exactly: { "epoch #0": 1 },
+};
+
+// The InputBox already holds one input the node has not indexed: the OPEN row
+// says so and the ⓘ tooltip explains both numbers. The tap toggle is driven
+// too; its text is in the DOM either way (CSS-hidden, not `hidden`).
+SCENARIOS.processing = {
+  ...SCENARIOS.dispute,
+  hash: "",
+  l1: chain(
+    ...Object.entries(SCENARIOS.dispute.l1),
+    l1Uint("getNumberOfInputs(address)", 5), // open epoch 2 has bounds 2..4
+  ),
+  hooks: `${driveSleep}
+    await sleep(1500);
+    document.getElementById("lc-open-inputs-info").click();`,
+  expect: [
+    "2 inputs (1 input being processed)",
+    "2 inputs: inputs the node has indexed for this epoch (indices 2–3).",
+    "1 being processed: the InputBox holds 5 inputs for this app at the chain's pending block; the node reports 4.",
+    "reads the chain at its LATEST block",
+  ],
+  forbid: ["onchain count unavailable", "live unreachable", "config mismatch"],
+  rawExpect: ['class="lc-inputs-wrap open"'],
+};
+
+// A wallet that signs: the run is posted, the receipt confirms, and the
+// Rollup-state panel is refreshed right away — the chain count grows by one
+// as soon as the page has looked the receipt up, so "(1 input being
+// processed)" must show within the budget, well before the 60 s idle poll.
+const ETHEREUM_SIGNING_STUB = `window.ethereum = {
+  isStub: true,
+  on() {},
+  async request({ method }) {
+    if (method === "eth_chainId") return "0x7a69";
+    if (method === "eth_accounts" || method === "eth_requestAccounts") return ["${PLAYER(0)}"];
+    if (method === "eth_sendTransaction") return "${TX_HASH}";
+    throw new Error("stub: " + method);
+  },
+};`;
+SCENARIOS.runposted = {
+  ...SCENARIOS.newrun,
+  prelude: ETHEREUM_SIGNING_STUB,
+  l1: chain(
+    ...Object.entries(SCENARIOS.dispute.l1),
+    [toFunctionSelector("addInput(address,bytes)"), H(0)], // simulateContract
+    [
+      toFunctionSelector("getNumberOfInputs(address)"),
+      (_req, seen) => enc("uint256", [seen.includes("eth_getTransactionReceipt") ? 5n : 4n]),
+    ],
+  ),
+  hooks: `${SCENARIOS.newrun.hooks}
+    await sleep(200);
+    document.getElementById("run-primary").click();
+    await sleep(3000);`,
+  expect: [
+    "// posted onchain ✓",
+    "being processed",
+    "Play again",
+    "2 inputs (1 input being processed)",
+    "1 being processed: the InputBox holds 5 inputs for this app at the chain's pending block; the node reports 4.",
+  ],
+  forbid: ["// run recorded", "// submit failed", "check status", "send again anyway", "install a wallet", "not confirmed yet"],
+  minNodeCalls: { cartesi_listEpochs: 4 }, // boot (2) + at least one post-submit refresh (2)
+};
+
 // -------------------------------------------------------------
 // servers
 // -------------------------------------------------------------
@@ -590,7 +735,10 @@ function fakeNode(scenario) {
 }
 
 // Minimal Ethereum JSON-RPC: block number, chain id, and eth_call answered by
-// selector from `calls` (anything else reverts). Handles viem's batches.
+// selector from `calls` (anything else reverts); an answer may be a function
+// of (request, seen) so it can change once the page has done something. The
+// receipt and gas-estimate paths exist for the posted-run scenario. Handles
+// viem's batches.
 function fakeL1(calls = {}, seen = []) {
   const answer = (req) => {
     const id = req.id;
@@ -602,10 +750,17 @@ function fakeL1(calls = {}, seen = []) {
         return { jsonrpc: "2.0", id, result: hex(L1_BLOCK) };
       case "eth_call": {
         const data = req.params?.[0]?.data ?? "0x";
-        const out = calls[data.slice(0, 10).toLowerCase()];
+        let out = calls[data.slice(0, 10).toLowerCase()];
+        if (typeof out === "function") out = out(req, seen);
         if (out) return { jsonrpc: "2.0", id, result: out };
         return { jsonrpc: "2.0", id, error: { code: 3, message: "execution reverted" } };
       }
+      case "eth_estimateGas":
+        return { jsonrpc: "2.0", id, result: "0x30d40" };
+      case "eth_getTransactionReceipt":
+        return { jsonrpc: "2.0", id, result: receipt(req.params?.[0]) };
+      case "eth_getTransactionByHash":
+        return { jsonrpc: "2.0", id, result: null };
       default:
         return { jsonrpc: "2.0", id, error: { code: -32601, message: "method not found" } };
     }
@@ -820,6 +975,23 @@ for (const key of keys) {
     const ok = !text.includes(s);
     if (!ok) failures++;
     console.log(`  ${ok ? "PASS" : "FAIL"}  does not show "${s}"`);
+  }
+  for (const [s, want] of Object.entries(scenario.exactly ?? {})) {
+    const n = text.split(s).length - 1;
+    const ok = n === want;
+    if (!ok) failures++;
+    console.log(`  ${ok ? "PASS" : "FAIL"}  shows "${s}" ${n}× (want ${want})`);
+  }
+  for (const s of scenario.rawExpect ?? []) {
+    const ok = result.html.includes(s);
+    if (!ok) failures++;
+    console.log(`  ${ok ? "PASS" : "FAIL"}  markup has ${s}`);
+  }
+  for (const [method, min] of Object.entries(scenario.minNodeCalls ?? {})) {
+    const n = seen.filter((m) => m === method).length;
+    const ok = n >= min;
+    if (!ok) failures++;
+    console.log(`  ${ok ? "PASS" : "FAIL"}  ${method} called ${n}× (≥ ${min})`);
   }
   const noErrors = result.consoleErrors.length === 0;
   if (!noErrors) failures++;

@@ -11,7 +11,9 @@ export const CHAIN_ID = "0x7A69"; // anvil devnet
 // Application contract address
 // export const APPLICATION_ADDRESS = "0x3a53856a1440ac887721501d2d13a6c82b7310c0"; // blank
 // export const APPLICATION_ADDRESS = "0xc50e72fEdFD01973A17489F92e8fa20AfBf6e323"; // cartesapp
-export const APPLICATION_ADDRESS = "0x8f0119224ed78f4b5eab03c9ab7f9876ad760288"; // cartesi-bin
+export const APPLICATION_ADDRESS = "0xFaBEC424DE65b937092D33ec07fd8Db39Eb98229"; // cartesapp prt
+// export const APPLICATION_ADDRESS = "0x8f0119224ed78f4b5eab03c9ab7f9876ad760288"; // cartesi-bin
+// export const APPLICATION_ADDRESS = "0xfabec424de65b937092d33ec07fd8db39eb98229"; // cartesi-bin prt
 // export const APPLICATION_ADDRESS = "0xA617f08B95EfdD5496E22F1FE7e378280dF5b831"; // base sepolia
 
 // Cartesi node URL (JSON-RPC is served at `${NODE_URL}/rpc`).
@@ -20,8 +22,8 @@ export const APPLICATION_ADDRESS = "0x8f0119224ed78f4b5eab03c9ab7f9876ad760288";
 // answer when the node allows this site's exact origin:
 //   CARTESI_JSONRPC_CORS_ALLOWED_ORIGINS=http://localhost:3000
 // (CORS is off by default; wildcard is not supported.)
-// export const NODE_URL = "http://localhost:8080";
-export const NODE_URL = "http://localhost:6752";
+export const NODE_URL = "http://localhost:8080";
+// export const NODE_URL = "http://localhost:6751";
 // export const NODE_URL = "https://doom-sepolia-bare.rives.io"; // rives infra
 // export const NODE_URL = "https://base-sepolia.rollups.cartesi.io/v2"; // cartesi cloud infra
 
@@ -45,4 +47,5 @@ export const APPLICATION_NAME = "";
 // Sepolia's default will rate-limit once tournament reads are polling.
 // This is baked into the published bundle, so use a domain-restricted or
 // keyless endpoint, never a secret one.
-export const L1_RPC_URL = "http://localhost:6752/anvil";
+export const L1_RPC_URL = "http://localhost:8545";
+// export const L1_RPC_URL = "http://localhost:6751/anvil";

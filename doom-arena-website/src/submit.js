@@ -283,7 +283,7 @@ export function runOverlayModel(run, env = {}) {
         ...base,
         kind: "ok",
         eyebrow: "// posted onchain ✓",
-        text: "it can take a few minutes to show up on the leaderboard while the node processes it",
+        text: "the node is processing it · the Rollup state panel counts it as “being processed” until the node picks it up · it can take a few minutes to show up on the leaderboard",
         primary: { label: "Play again", action: "again", disabled: false, reason: null },
       };
     case "failed":

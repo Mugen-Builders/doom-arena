@@ -391,6 +391,7 @@ test("posted: Play again only", () => {
   const m = runOverlayModel(run("ok", { txHash: TX }), ENV);
   assert.equal(m.kind, "ok");
   assert.match(m.eyebrow, /posted onchain/);
+  assert.match(m.text, /being processed/);
   assert.deepEqual(m.primary, { label: "Play again", action: "again", disabled: false, reason: null });
   assert.equal(m.discard, false);
   assert.equal(m.resend, false);
