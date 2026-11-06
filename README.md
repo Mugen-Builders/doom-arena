@@ -1,7 +1,7 @@
 # Doom Arena
 
 ```
-Cartesi Rollups Node version: 2.1.x
+Cartesi Rollups Node version: 2.0.x
 ```
 
 Doom Arena is a proof of concept that allows users to play the [riscv-binary port of Freedoom](https://github.com/rives-io/cartridge-freedoom) on a RISC-v Cartesi Machine on the browser, submit the game moves onchain so the session will be replayed in a Cartesi Rollups App to generate a provable score.
@@ -22,7 +22,7 @@ Install Cartesapp:
 ```shell
 python3 -m venv .venv
 . .venv/bin/activate
-pip3 install cartesapp[dev]@git+https://github.com/prototyp3-dev/cartesapp@v1.2.6
+pip3 install cartesapp[dev]@git+https://github.com/prototyp3-dev/cartesapp@v1.5.0
 pip3 install pytest-randomly
 ```
 

@@ -18,7 +18,6 @@
 
 extern "C" {
 #include <fcntl.h>    // open
-#include <sys/mman.h> // mmap/msync
 #include <sys/stat.h> // stat
 #include <sys/wait.h> // waitpid
 #include <unistd.h>   // close/lseek
@@ -39,6 +38,7 @@ extern "C" {
 #define MAX_ERROR_REPORT_LENGTH MAX_ERROR_MESSAGE_LENGTH + 50
 
 #define DEBUG(X) log_debug(X)
+#define INFO(X) log_info(X)
 #define ERROR(X) log_error(X, __FILE__, __LINE__)
 
 namespace {
@@ -64,6 +64,29 @@ bool debug_enabled(void) {
   return enabled;
 }
 
+bool info_enabled(void) {
+  static bool checked = false;
+  static bool enabled = false;
+
+  if (!checked) {
+    if (getenv("RIVES_LOG_LEVEL") != NULL) {
+      std::string log_level = getenv("RIVES_LOG_LEVEL");
+      std::transform(log_level.begin(), log_level.end(), log_level.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      std::string trace_log_level = "trace";
+      std::string debug_log_level = "debug";
+      std::string info_log_level = "info";
+      if (log_level == trace_log_level || log_level == debug_log_level ||
+          log_level == info_log_level) {
+        enabled = true;
+      }
+    }
+    checked = true;
+  }
+
+  return enabled;
+}
+
 bool error_enabled(void) {
   static bool checked = false;
   static bool enabled = false;
@@ -75,10 +98,12 @@ bool error_enabled(void) {
                      [](unsigned char c) { return std::tolower(c); });
       std::string trace_log_level = "trace";
       std::string debug_log_level = "debug";
+      std::string info_log_level = "info";
       std::string warn_log_level = "warn";
       std::string error_log_level = "error";
       if (log_level == trace_log_level || log_level == debug_log_level ||
-          log_level == warn_log_level || log_level == error_log_level) {
+          log_level == info_log_level || log_level == warn_log_level ||
+          log_level == error_log_level) {
         enabled = true;
       }
     }
@@ -90,13 +115,19 @@ bool error_enabled(void) {
 
 static void log_debug(std::string expr) {
   if (debug_enabled()) {
-    std::ignore = std::fprintf(stdout, "[rives] DEBUG %s\n", expr.c_str());
+    std::ignore = std::fprintf(stdout, "[arena] DEBUG %s\n", expr.c_str());
+  }
+}
+
+static void log_info(std::string expr) {
+  if (info_enabled()) {
+    std::ignore = std::fprintf(stdout, "[arena] INFO  %s\n", expr.c_str());
   }
 }
 
 static void log_error(std::string expr, const char *file, int line) {
   if (error_enabled()) {
-    std::ignore = std::fprintf(stderr, "[rives] ERROR %s:%d %s\n", file, line,
+    std::ignore = std::fprintf(stderr, "[arena] ERROR %s:%d %s\n", file, line,
                                expr.c_str());
   }
 }
@@ -184,7 +215,6 @@ bool rollup_process_next_request(cmt_rollup_t *rollup,
   DEBUG(std::format("finishing previous request with status {}",
                     last_request_status));
   cmt_rollup_finish_t finish{.accept_previous_request = last_request_status};
-  sync(); // ensure data is written to disk
   const int err = cmt_rollup_finish(rollup, &finish);
   if (err < 0) {
     ERROR(std::format("unable to perform rollup finish: {}",
@@ -288,7 +318,7 @@ void process_verification(cmt_rollup_t *rollup,
   for (int i(0); i < CMT_ABI_ADDRESS_LENGTH; ++i)
     msg_sender_ss << std::setw(2) << std::setfill('0')
                   << static_cast<int>(input.msg_sender.data[i]);
-  DEBUG(std::format("Msg sender: {}", msg_sender_ss.str().c_str()));
+  INFO(std::format("processing gameplay from msg sender: {}", msg_sender_ss.str().c_str()));
 
   // Step 2.2: prepare temp files
   //
@@ -446,6 +476,7 @@ void process_verification(cmt_rollup_t *rollup,
   DEBUG(std::format("found score matches={}", score_matches.size()));
   DEBUG(std::format("full match: {}", score_matches[0].str().c_str()));
   DEBUG(std::format("group 1: {}", score_matches[1].str().c_str()));
+  INFO(std::format("Gameplay score: {}", score_matches[1].str().c_str()));
 
   int64_t score = std::stoi(score_matches[1].str());
 
@@ -493,7 +524,7 @@ bool advance_state(cmt_rollup_t *rollup) {
     DEBUG(std::format("advance request with size {}", input.payload.length));
 
     process_verification(rollup, input);
-    ERROR("gameplay verified");
+    INFO("gameplay verified");
 
   } catch (const RivesException &e) {
     ERROR(std::format("rives exception caught: ({}) {}",
@@ -592,6 +623,7 @@ int main() {
                           std::strerror(-err_merkle)));
         return -1;
       }
+      sync(); // ensure data is written to disk
       umask(original_umask);
     }
 

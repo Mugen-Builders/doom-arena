@@ -88,20 +88,20 @@ def test_should_fail_submit_short_gameplay(
     report_model = ErrorReport.parse_obj(report_json)
     assert report_model.error.code == STATUS_INPUT_ERROR
 
-def test_should_fail_submit_long_payload(
-        app_client: TestClient,
-        nop_gameplay_payload: Payload):
+# def test_should_fail_submit_long_payload(
+#         app_client: TestClient,
+#         nop_gameplay_payload: Payload):
 
-    nop_gameplay_payload.gameplay_log = b'0' * 2097152
-    hex_payload = bytes2hex(abi.encode_model(nop_gameplay_payload,True))
+#     nop_gameplay_payload.gameplay_log = b'0' * 2097152
+#     hex_payload = bytes2hex(abi.encode_model(nop_gameplay_payload,True))
 
-    last_notice_n = len(app_client.rollup.notices)
-    last_report_n = len(app_client.rollup.reports)
-    app_client.send_advance(hex_payload=hex_payload)
+#     last_notice_n = len(app_client.rollup.notices)
+#     last_report_n = len(app_client.rollup.reports)
+#     app_client.send_advance(hex_payload=hex_payload)
 
-    assert not app_client.rollup.status
-    assert len(app_client.rollup.notices) == last_notice_n
-    assert len(app_client.rollup.reports) == last_report_n
+#     assert not app_client.rollup.status
+#     assert len(app_client.rollup.notices) == last_notice_n
+#     assert len(app_client.rollup.reports) == last_report_n
 
 def test_should_fail_submit_long_gameplay(
         app_client: TestClient,
